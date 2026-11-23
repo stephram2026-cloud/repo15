@@ -1,0 +1,3956 @@
+diff --git a/docs/release-notes.md b/docs/release-notes.md
+index e44e3a8..eb60698 100644
+--- a/docs/release-notes.md
++++ b/docs/release-notes.md
+@@ -5,6 +5,20 @@
+ ### Bug Fixes
+ 
+ - Fixed concurrent probe shutdowns panicking with `close of closed channel`. Probe starts and stops are now serialized, and a pending initial-delay start cannot revive a stopped or superseded probe.
++- Fixed a restarted process failing with `address already in use` (or otherwise colliding with itself) because the new instance was launched while the old one was still shutting down. This hit [file-watch](https://f1bonacc1.github.io/process-compose/watch/) restarts in particular, which skip the restart backoff that used to hide it. A restart now waits until the old instance - its [whole process group](https://f1bonacc1.github.io/process-compose/launcher/#when-is-a-process-stopped), not just a shell wrapper in front of the real server - has exited. For the same reason a stopped process now stays `Terminating` until its process group is gone, and with `shutdown.timeout_seconds` set, group members that outlive the command are killed at the timeout as documented. Without a timeout a process that ignores its stop signal is never killed, so a restart now waits for it instead of starting a second copy next to it.
++- Fixed a process that had exited still showing as `Running`, and its `process_completed` / `process_completed_successfully` dependents never starting, when something it started in the background kept its `stdout` or `stderr` open (a migration script launching a helper, `pg_ctl start` without a log file). A process now completes when its command exits. The output of whatever it left behind is still captured.
++- Fixed `process-compose` exiting with `255` instead of the exit code of the process that ended the project. With more than one process carrying `exit_on_end` or `exit_on_failure`, the ones terminated by the shutdown overwrote the exit code of the process that caused it - so a failing test run reported `255` rather than its own code, and so did a passing one. The first process to end the project now decides its exit code, and a shutdown requested with `Ctrl+C` or `process-compose down` exits with `0`.
++- Fixed `process-compose run` terminating itself and the script that called it (`Terminated`, exit `143`) when the project shut down while the foreground process was still running, for instance because a dependency with `exit_on_failure` had failed. The caller never received the exit code and never reached its own clean-up. The foreground process shares the process group of `process-compose`, and stopping it signalled that whole group; it and its child processes are now signalled individually. The same applied to stopping an elevated process without the TUI.
++- Fixed `process-compose` leaving all of its processes running, ports included, when it was ended by `SIGQUIT` (`Ctrl+\`) - which also printed a dump of every goroutine - or by its output being closed (`process-compose up -t=false | head`). Both now [shut the processes down first](https://f1bonacc1.github.io/process-compose/launcher/#stopping-process-compose-itself), like `Ctrl+C` does. For a goroutine dump, send `SIGABRT`.
++- A second signal during a shutdown now forces it: the remaining processes are killed with `SIGKILL` and `process-compose` exits with `128 + signal`. Previously further signals were ignored, so a shutdown held up by a process that ignores its stop signal could only be escaped by killing `process-compose` itself, leaving that process and any others behind. Signals delivered together with the first one do not count.
++- Fixed stopping or restarting a process with [`is_tty`](https://f1bonacc1.github.io/process-compose/configuration/#pseudo-terminals) cutting off its log at the stop signal and corrupting its exit code. Its terminal was closed the moment the signal was sent, so everything it wrote while shutting down was lost and failed to write - which is why a program that exited cleanly could be reported with a code such as `120`, the status some runtimes use for a failed flush at exit. It was also sent `SIGHUP` in place of the configured `SIGTERM`. Such a process is now stopped like any other: it gets the configured signal, its shutdown output is logged, and it reports its own exit code. A tty process that relied on being hung up - one that ignores `SIGTERM` - needs `shutdown.signal: 1` or `shutdown.timeout_seconds`. Interactive processes (`is_interactive`) are still ended by hanging up.
++- Fixed processes terminated by a signal reporting exit code `-1`. They now report `128 + signal` (`143` for `SIGTERM`, `137` for `SIGKILL`), as [documented](https://f1bonacc1.github.io/process-compose/launcher/#successful-exit-codes), which also makes such exits matchable by `success_exit_codes`. Anything that compares a process `exit_code` to `-1` needs updating.
++- Fixed a process being killed shortly after it was restarted by a failed readiness probe when `shutdown.timeout_seconds` was set: the `SIGKILL` armed for the instance being stopped was delivered to its replacement once the timeout expired.
++- Fixed a process that was stopped, or restarted, at the very moment it was being launched starting anyway, and one that ended at the very moment it was stopped being left in `Terminating`.
++- Fixed a process launched while the project was shutting down - by an in-flight restart or a schedule - being left running after `process-compose` had exited.
++- Stopping an [`is_daemon`](https://f1bonacc1.github.io/process-compose/launcher/#background-detached-processes) process that has no `shutdown.command` no longer leaves it stuck in `Terminating`, which also made the next project shutdown hang. A daemon that has detached from the process group of its launcher cannot be reached by a signal: stopping or restarting it now fails with an error that says so and leaves it `Launched`, since it is still running, and a project shutdown leaves it running with a warning instead of hanging. A daemon that is still in that group is signalled and reported as stopped once it has really exited.
++- Fixed a possible `send on closed channel` crash when a process wrote to its `log_location` file at the moment that log was being closed.
++- The TUI no longer freezes while a process is being restarted with the restart shortcut.
+ 
+ ## [v1.124.0] - 2026-10-27
+ 
+diff --git a/go.mod b/go.mod
+index e83a2e4..0ee977c 100644
+--- a/go.mod
++++ b/go.mod
+@@ -32,6 +32,7 @@ require (
+ 	github.com/swaggo/files v1.0.1
+ 	github.com/swaggo/gin-swagger v1.6.1
+ 	github.com/swaggo/swag v1.16.6
++	golang.org/x/sys v0.49.0
+ 	gopkg.in/natefinch/lumberjack.v2 v2.2.1
+ 	gopkg.in/yaml.v3 v3.0.1
+ )
+@@ -105,7 +106,6 @@ require (
+ 	golang.org/x/mod v0.42.0 // indirect
+ 	golang.org/x/net v0.61.0 // indirect
+ 	golang.org/x/sync v0.24.0 // indirect
+-	golang.org/x/sys v0.49.0 // indirect
+ 	golang.org/x/term v0.47.0 // indirect
+ 	golang.org/x/text v0.43.0 // indirect
+ 	golang.org/x/tools v0.52.0 // indirect
+diff --git a/src/app/daemon.go b/src/app/daemon.go
+index 0c2e477..2eff673 100644
+--- a/src/app/daemon.go
++++ b/src/app/daemon.go
+@@ -18,9 +18,17 @@ loop:
+ 
+ }
+ 
++// notifyDaemonStopped tells the run loop that a launched daemon is to be
++// considered stopped. One pending notification is enough, so a second one is
++// dropped rather than left to block its sender: a stop and a failed liveness
++// probe can both report the same daemon.
+ func (p *Process) notifyDaemonStopped() {
+-	if p.procConf.IsDaemon {
+-		p.procStateChan <- types.ProcessStateCompleted
++	if !p.procConf.IsDaemon {
++		return
++	}
++	select {
++	case p.procStateChan <- types.ProcessStateCompleted:
++	default:
+ 	}
+ }
+ 
+diff --git a/src/app/daemon_stop_unix_test.go b/src/app/daemon_stop_unix_test.go
+new file mode 100644
+index 0000000..9e41956
+--- /dev/null
++++ b/src/app/daemon_stop_unix_test.go
+@@ -0,0 +1,202 @@
++//go:build !windows
++
++package app
++
++import (
++	"errors"
++	"fmt"
++	"os"
++	"path/filepath"
++	"strconv"
++	"strings"
++	"syscall"
++	"testing"
++	"time"
++
++	"github.com/f1bonacc1/process-compose/src/command"
++	"github.com/f1bonacc1/process-compose/src/types"
++)
++
++// daemonProject runs a single daemon whose launcher starts `daemon` in the
++// background, records its PID and exits. It returns the runner, the channel
++// Run reports on, and the daemon's PID.
++func daemonProject(t *testing.T, daemon string, params types.ShutDownParams) (*ProjectRunner, chan error, int) {
++	t.Helper()
++	shell := command.DefaultShellConfig()
++	const name = "redis"
++	pidFile := filepath.Join(t.TempDir(), "pid")
++	runner, err := NewProjectRunner(&ProjectOpts{
++		project: &types.Project{
++			ShellConfig: shell,
++			Processes: map[string]types.ProcessConfig{
++				name: {
++					Name:        name,
++					ReplicaName: name,
++					IsDaemon:    true,
++					Executable:  shell.ShellCommand,
++					Args: []string{shell.ShellArgument,
++						fmt.Sprintf("%s >/dev/null 2>&1 & echo $! > %q", daemon, pidFile)},
++					ShutDownParams: params,
++				},
++			},
++		},
++	})
++	if err != nil {
++		t.Fatal(err)
++	}
++	done := make(chan error, 1)
++	go func() { done <- runner.Run() }()
++	waitForProcessState(t, runner, name, types.ProcessStateLaunched, 10*time.Second)
++
++	data, err := os.ReadFile(pidFile)
++	if err != nil {
++		t.Fatal(err)
++	}
++	pid, err := strconv.Atoi(strings.TrimSpace(string(data)))
++	if err != nil {
++		t.Fatal(err)
++	}
++	t.Cleanup(func() { _ = syscall.Kill(pid, syscall.SIGKILL) })
++	return runner, done, pid
++}
++
++// isRunning reports whether pid is a live process. An exited one that has not
++// been reaped yet does not count.
++func isRunning(pid int) bool {
++	if errors.Is(syscall.Kill(pid, 0), syscall.ESRCH) {
++		return false
++	}
++	data, err := os.ReadFile(fmt.Sprintf("/proc/%d/stat", pid))
++	if err != nil {
++		return true
++	}
++	// "pid (comm) state ...": the state follows the command name.
++	stat := string(data)
++	fields := strings.Fields(stat[strings.LastIndexByte(stat, ')')+1:])
++	return len(fields) == 0 || fields[0] != "Z"
++}
++
++func waitUntilGone(pid int, timeout time.Duration) bool {
++	deadline := time.Now().Add(timeout)
++	for isRunning(pid) {
++		if time.Now().After(deadline) {
++			return false
++		}
++		time.Sleep(20 * time.Millisecond)
++	}
++	return true
++}
++
++// A daemon that detached into its own session - as `redis-server --daemonize
++// yes` does - is out of reach once its launcher has exited. Stopping it without
++// a shutdown command must fail and say so, and must leave it reported as what
++// it is: still running. It must never be reported as stopped.
++func TestStopOfDetachedDaemonFails(t *testing.T) {
++	const name = "redis"
++	runner, done, pid := daemonProject(t, "setsid sleep 60", types.ShutDownParams{})
++
++	for attempt := 1; attempt <= 2; attempt++ {
++		err := runner.StopProcess(name)
++		if !errors.Is(err, errDaemonUnreachable) {
++			t.Fatalf("stop attempt %d returned %v, want %v", attempt, err, errDaemonUnreachable)
++		}
++		if !strings.Contains(err.Error(), "shutdown.command") {
++			t.Errorf("error does not say how to fix it: %v", err)
++		}
++		state, err := runner.GetProcessState(name)
++		if err != nil {
++			t.Fatal(err)
++		}
++		if state.Status != types.ProcessStateLaunched {
++			t.Errorf("status after failed stop attempt %d = %s, want %s", attempt, state.Status, types.ProcessStateLaunched)
++		}
++	}
++	if !isRunning(pid) {
++		t.Fatal("the daemon is gone; the test no longer exercises a daemon that survives the stop")
++	}
++
++	// A restart must not launch a second copy next to the one it cannot stop.
++	if err := runner.RestartProcess(name); !errors.Is(err, errDaemonUnreachable) {
++		t.Errorf("restart returned %v, want %v", err, errDaemonUnreachable)
++	}
++
++	// Shutting the project down cannot stop it either, but must not hang on it.
++	shutdown := make(chan struct{})
++	go func() {
++		defer close(shutdown)
++		_ = runner.ShutDownProject()
++	}()
++	select {
++	case <-shutdown:
++	case <-time.After(10 * time.Second):
++		t.Fatal("project shutdown hangs on a daemon it cannot stop")
++	}
++	select {
++	case err := <-done:
++		if err != nil {
++			t.Errorf("project exited with %v", err)
++		}
++	case <-time.After(10 * time.Second):
++		t.Fatal("project did not exit")
++	}
++}
++
++// A daemon that stayed in its launcher's process group can be signalled. It is
++// reported as stopped when it is gone - not before, and not merely because a
++// signal was sent.
++func TestStopOfDaemonInLauncherGroup(t *testing.T) {
++	const name = "redis"
++	t.Run("exits on the signal", func(t *testing.T) {
++		runner, _, pid := daemonProject(t, "sleep 60", types.ShutDownParams{})
++		t.Cleanup(func() { _ = runner.ShutDownProject() })
++
++		if err := runner.StopProcess(name); err != nil {
++			t.Fatalf("stop: %v", err)
++		}
++		waitForProcessState(t, runner, name, types.ProcessStateCompleted, 10*time.Second)
++		if isRunning(pid) {
++			t.Error("daemon reported as stopped while still running")
++		}
++	})
++
++	t.Run("ignores the signal, no timeout", func(t *testing.T) {
++		runner, _, pid := daemonProject(t, `bash -c 'trap "" TERM; while :; do sleep 0.05; done'`, types.ShutDownParams{})
++		t.Cleanup(func() { _ = runner.ShutDownProject() })
++		// Let the daemon install its trap.
++		time.Sleep(300 * time.Millisecond)
++
++		if err := runner.StopProcess(name); err != nil {
++			t.Fatalf("stop: %v", err)
++		}
++		// Nothing kills it, so it must not be reported as stopped.
++		time.Sleep(time.Second)
++		if !isRunning(pid) {
++			t.Fatal("the daemon exited; the test no longer exercises a daemon that ignores the signal")
++		}
++		state, err := runner.GetProcessState(name)
++		if err != nil {
++			t.Fatal(err)
++		}
++		if state.Status != types.ProcessStateTerminating {
++			t.Errorf("status = %s while the daemon is still running, want %s", state.Status, types.ProcessStateTerminating)
++		}
++		// Once it is really gone, the state follows.
++		_ = syscall.Kill(pid, syscall.SIGKILL)
++		waitForProcessState(t, runner, name, types.ProcessStateCompleted, 10*time.Second)
++	})
++
++	t.Run("ignores the signal, killed at the timeout", func(t *testing.T) {
++		runner, _, pid := daemonProject(t, `bash -c 'trap "" TERM; while :; do sleep 0.05; done'`,
++			types.ShutDownParams{ShutDownTimeout: 1})
++		t.Cleanup(func() { _ = runner.ShutDownProject() })
++		time.Sleep(300 * time.Millisecond)
++
++		if err := runner.StopProcess(name); err != nil {
++			t.Fatalf("stop: %v", err)
++		}
++		if !waitUntilGone(pid, 5*time.Second) {
++			t.Fatal("daemon survived its shutdown timeout")
++		}
++		waitForProcessState(t, runner, name, types.ProcessStateCompleted, 10*time.Second)
++	})
++}
+diff --git a/src/app/process.go b/src/app/process.go
+index 4abe11e..f26abb6 100644
+--- a/src/app/process.go
++++ b/src/app/process.go
+@@ -33,8 +33,77 @@ const (
+ 	DefaultShutdownTimeoutSec   = 10
+ 	EnvReplicaNum               = "PC_REPLICA_NUM"
+ 	LogReplicaNum               = "{" + EnvReplicaNum + "}"
++
++	// outputIdleGrace is how long an output reader may sit waiting for input,
++	// after the command has exited, before the stream is taken to be held open
++	// by some other process rather than still carrying the command's output.
++	outputIdleGrace = 500 * time.Millisecond
++	// outputDrainTimeout caps the wait for a command's remaining output when
++	// whoever holds the stream open never stops writing to it.
++	outputDrainTimeout = 5 * time.Second
++	outputPollInterval = 20 * time.Millisecond
++	// groupExitGrace is how much longer than the shutdown timeout a stopped
++	// process group is waited for, to cover the SIGKILL sent at the timeout.
++	groupExitGrace = 2 * time.Second
++	// daemonExitPollInterval is how often a signalled daemon is checked for
++	// having exited.
++	daemonExitPollInterval = 500 * time.Millisecond
+ )
+ 
++// errDaemonUnreachable is returned when a daemon cannot be stopped because no
++// signal of ours can reach it.
++var errDaemonUnreachable = errors.New("cannot be stopped by a signal")
++
++// errStartAborted is returned by the process starter when the process was
++// stopped before its command could be launched.
++var errStartAborted = errors.New("process was stopped before it could start")
++
++// incarnation is one launch of a process's command. A Process outlives its
++// command when a restart policy relaunches it, so anything that acts on "the
++// command that was running when the stop was requested" has to hold on to that
++// launch rather than look the command up again later.
++type incarnation struct {
++	cmd command.Commander
++	// exited is closed once the command has exited and, if it was stopped
++	// through its process group, once that group is empty as well.
++	exited chan struct{}
++	// groupSignalled records that a stop signal was sent to the command's
++	// whole process group, which makes the group ours to wait for.
++	groupSignalled atomic.Bool
++}
++
++// outputStream tracks the goroutine reading one of the command's output pipes.
++type outputStream struct {
++	// done is closed when the reader has reached the end of the stream.
++	done chan struct{}
++	// blockedSince is when (UnixNano) the reader last began waiting for input,
++	// or 0 while it is handling a line. A reader that stays blocked has
++	// consumed everything written so far.
++	blockedSince atomic.Int64
++	// ownsPipe is set when the reader should close the pipe once it is done
++	// with it. A PTY is shared with the terminal view and closed elsewhere.
++	ownsPipe bool
++}
++
++func newOutputStream(ownsPipe bool) *outputStream {
++	return &outputStream{done: make(chan struct{}), ownsPipe: ownsPipe}
++}
++
++// idleSince returns the moment from which the reader has been continuously
++// waiting for input, not earlier than notBefore. ok is false while the reader
++// is busy with a line.
++func (s *outputStream) idleSince(notBefore time.Time) (since time.Time, ok bool) {
++	blocked := s.blockedSince.Load()
++	if blocked == 0 {
++		return time.Time{}, false
++	}
++	since = time.Unix(0, blocked)
++	if since.Before(notBefore) {
++		since = notBefore
++	}
++	return since, true
++}
++
+ type Process struct {
+ 	sync.Mutex
+ 	globalEnv            []string
+@@ -62,6 +131,7 @@ type Process struct {
+ 	logBuffer            *pclog.ProcessLogBuffer
+ 	logger               pclog.PcLogger
+ 	command              command.Commander
++	current              *incarnation // guarded by stateMtx, see currentIncarnation
+ 	started              bool
+ 	done                 bool
+ 	timeMutex            sync.Mutex
+@@ -77,8 +147,8 @@ type Process struct {
+ 	stdin                io.WriteCloser
+ 	passProvided         bool
+ 	isTuiEnabled         bool
+-	stdOutDone           chan struct{}
+-	stdErrDone           chan struct{}
++	stdOut               *outputStream
++	stdErr               *outputStream
+ 	dotEnvVars           map[string]string
+ 	truncateLogs         bool
+ 	metricsProc          *puproc.Process
+@@ -154,9 +224,19 @@ func (p *Process) run() int {
+ 	}
+ 
+ 	p.onProcessStart()
++	launched := false
+ loop:
+ 	for {
+ 		err := p.setStateAndRun(p.getStartingStateName(), p.getProcessStarter())
++		if errors.Is(err, errStartAborted) {
++			log.Debug().Str("process", p.getName()).Msg("process stopped before its command was launched")
++			if !launched {
++				// Stopped while still Pending: the stop already ended the
++				// process, exactly as if it had arrived a moment earlier.
++				return 0
++			}
++			break loop
++		}
+ 		if err != nil {
+ 			log.Error().Err(err).Msgf(`Failed to run command ["%v"] for process %s`, strings.Join(p.getCommand(), `" "`), p.getName())
+ 			p.logBuffer.Write(err.Error())
+@@ -188,10 +268,18 @@ loop:
+ 			Strs("command", p.getCommand()).
+ 			Msg("Started")
+ 
++		launched = true
++		inc := p.current
++
+ 		p.startProbes()
+ 
++		// The exit of the command is what ends this launch - not the end of
++		// its output, which a child it left behind can keep open indefinitely.
++		_ = inc.cmd.Wait()
++		p.waitForGroupExit(inc)
++		close(inc.exited)
+ 		p.waitForStdOutErr()
+-		_ = p.command.Wait()
++		p.closePty(inc)
+ 		p.Lock()
+ 		p.setExitCode(p.command.ExitCode())
+ 		p.Unlock()
+@@ -228,51 +316,107 @@ loop:
+ 	return p.getExitCode()
+ }
+ 
++// waitForStdOutErr gives the output readers the chance to consume what the
++// command wrote before it exited, so that a process is not reported as ended
++// while its last lines are still in the pipe.
++//
++// Normally that means waiting for end of stream, which follows the exit at
++// once. But the stream only ends when *every* holder of its write end is gone,
++// and a command can leave one behind: a migration script that starts a helper
++// in the background, `pg_ctl start` without a log file, anything daemonizing
++// without redirecting its output. The command's own output is complete as soon
++// as the reader sits idle, so that is where the wait stops. The reader itself
++// is left running: whatever the survivor writes still reaches the log, and it
++// is not killed by a closed pipe.
+ func (p *Process) waitForStdOutErr() {
+-	ctx, cancel := context.WithCancel(context.Background())
+-	if p.procConf.IsDaemon {
+-		ctx, cancel = context.WithTimeout(context.Background(), time.Duration(p.procConf.LaunchTimeout)*time.Second)
+-	} else if p.isState(types.ProcessStateTerminating) {
+-		// In terminating state, never block forever on stdout/stderr drain.
+-		// Reaching command.Wait() is required to reap child processes.
+-		timeoutSec := p.procConf.ShutDownParams.ShutDownTimeout
+-		if timeoutSec == UndefinedShutdownTimeoutSec {
+-			timeoutSec = DefaultShutdownTimeoutSec
++	type namedStream struct {
++		name string
++		*outputStream
++	}
++	streams := make([]namedStream, 0, 2)
++	if p.stdOut != nil {
++		streams = append(streams, namedStream{"stdout", p.stdOut})
++	}
++	if p.stdErr != nil {
++		streams = append(streams, namedStream{"stderr", p.stdErr})
++	}
++	p.stdOut, p.stdErr = nil, nil
++	if len(streams) == 0 {
++		return
++	}
++
++	limit := outputDrainTimeout
++	if p.procConf.IsDaemon && p.procConf.LaunchTimeout > 0 {
++		limit = time.Duration(p.procConf.LaunchTimeout) * time.Second
++	}
++	exitedAt := time.Now()
++	ticker := time.NewTicker(outputPollInterval)
++	defer ticker.Stop()
++
++	for _, stream := range streams {
++	drain:
++		for {
++			select {
++			case <-stream.done:
++				log.Debug().Msgf("%s %s done", p.getName(), stream.name)
++				break drain
++			case now := <-ticker.C:
++				if now.Sub(exitedAt) >= limit {
++					log.Debug().Msgf("%s %s is still being written to %v after the process exited, not waiting for it",
++						p.getName(), stream.name, limit)
++					return
++				}
++				if since, idle := stream.idleSince(exitedAt); idle && now.Sub(since) >= outputIdleGrace {
++					log.Debug().Msgf("%s %s is held open by another process, not waiting for it", p.getName(), stream.name)
++					break drain
++				}
++			}
+ 		}
+-		ctx, cancel = context.WithTimeout(context.Background(), time.Duration(timeoutSec)*time.Second)
+ 	}
++}
++
++// waitForGroupExit waits for the rest of a stopped command's process group.
++//
++// The stop signal goes to the whole group, and the command exiting does not
++// mean the group has: a shell wrapper is gone the instant SIGTERM arrives while
++// the server it started is still shutting down, port and all. Reporting the
++// process as stopped at that point is what lets a restart launch the
++// replacement into "address already in use".
++//
++// Only a group that was signalled is waited for. Children left behind by a
++// command that exited on its own are none of our business.
++func (p *Process) waitForGroupExit(inc *incarnation) {
++	if !inc.groupSignalled.Load() || p.procConf.IsDaemon {
++		return
++	}
++	timeout := DefaultShutdownTimeoutSec * time.Second
++	if configured := p.procConf.ShutDownParams.ShutDownTimeout; configured != UndefinedShutdownTimeoutSec {
++		// The group is killed when the shutdown timeout expires; allow for it.
++		timeout = time.Duration(configured)*time.Second + groupExitGrace
++	}
++	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+ 	defer cancel()
+-	if p.stdOutDone != nil {
+-		select {
+-		case <-ctx.Done():
+-			log.Debug().Msgf("%s stdout done with timeout", p.getName())
+-			return
+-		case <-p.procRunCtx.Done():
+-			log.Debug().Msgf("%s stdout abandoned: process stopped", p.getName())
+-			return
+-		case <-p.stdOutDone:
+-			log.Debug().Msgf("%s stdout done", p.getName())
+-		}
+-		p.stdOutDone = nil
++	if !inc.cmd.WaitGroupExit(ctx) {
++		log.Warn().Msgf("Processes started by %s are still running %v after it was stopped and exited. "+
++			"Set shutdown.timeout_seconds to have them killed", p.getName(), timeout)
+ 	}
+-	if p.stdErrDone != nil {
+-		select {
+-		case <-ctx.Done():
+-			log.Debug().Msgf("%s stderr done with timeout", p.getName())
+-			return
+-		case <-p.procRunCtx.Done():
+-			log.Debug().Msgf("%s stderr abandoned: process stopped", p.getName())
+-			return
+-		case <-p.stdErrDone:
+-			log.Debug().Msgf("%s stderr done", p.getName())
+-		}
+-		p.stdErrDone = nil
++}
++
++// closePty releases the command's PTY, if it has one, now that its output has
++// been read.
++func (p *Process) closePty(inc *incarnation) {
++	if pty := inc.cmd.GetPty(); pty != nil {
++		_ = pty.Close()
+ 	}
+ }
+ 
+ func (p *Process) getProcessStarter() func() error {
+ 	return func() error {
+ 		p.command = p.getCommander()
++		// Runs under stateMtx (see setStateAndRun), which is what publishes the
++		// new launch to a concurrent stop.
++		p.current = &incarnation{cmd: p.command, exited: make(chan struct{})}
++		p.stdOut, p.stdErr = nil, nil
+ 		p.command.SetEnv(p.getProcessEnvironment())
+ 		p.command.SetDir(p.procConf.WorkingDir)
+ 
+@@ -283,15 +427,24 @@ func (p *Process) getProcessStarter() func() error {
+ 			if p.truncateLogs {
+ 				p.logBuffer.Truncate()
+ 			}
++			// This branch reads output only for non-interactive processes, and
++			// of those only a tty process runs on a PTY.
++			isPty := p.procConf.IsTty
+ 			if !p.procConf.IsInteractive {
+-				stdout, _ := p.command.StdoutPipe()
+-				p.stdOutDone = make(chan struct{})
+-				go p.handleOutput(stdout, "stdout", p.handleInfo, p.stdOutDone)
++				stdout, err := p.command.StdoutPipe()
++				if err != nil {
++					return fmt.Errorf("failed to open stdout of %s: %w", p.getName(), err)
++				}
++				p.stdOut = newOutputStream(!isPty)
++				go p.handleOutput(stdout, "stdout", p.handleInfo, p.stdOut)
+ 			}
+ 			if !p.procConf.IsTty && !p.procConf.IsInteractive {
+-				stderr, _ := p.command.StderrPipe()
+-				p.stdErrDone = make(chan struct{})
+-				go p.handleOutput(stderr, "stderr", p.handleError, p.stdErrDone)
++				stderr, err := p.command.StderrPipe()
++				if err != nil {
++					return fmt.Errorf("failed to open stderr of %s: %w", p.getName(), err)
++				}
++				p.stdErr = newOutputStream(!isPty)
++				go p.handleOutput(stderr, "stderr", p.handleError, p.stdErr)
+ 			}
+ 		}
+ 
+@@ -312,6 +465,7 @@ func (p *Process) getCommander() command.Commander {
+ 		return command.BuildPtyCommand(
+ 			p.procConf.Executable,
+ 			p.mergeExtraArgs(),
++			p.procConf.IsInteractive,
+ 		)
+ 	} else {
+ 		return command.BuildCommand(
+@@ -496,6 +650,11 @@ func (p *Process) wontRun() {
+ 
+ // perform graceful process shutdown if defined in configuration
+ func (p *Process) shutDownNoRestart() error {
++	// Before the process is marked as stopped: a stop that cannot work must
++	// leave no trace.
++	if err := p.checkStoppable(); err != nil {
++		return err
++	}
+ 	p.prepareForShutDown()
+ 	return p.shutDown()
+ }
+@@ -538,10 +697,14 @@ func (p *Process) sendSignal(sig int) error {
+ }
+ 
+ func (p *Process) stopProcess(withNoRestart bool) error {
++	if err := p.checkStoppable(); err != nil {
++		return err
++	}
+ 	if withNoRestart {
+ 		p.runCancelFn()
+ 	}
+-	if !p.isRunning() {
++	inc, running := p.beginTerminating()
++	if !running {
+ 		log.Debug().Msgf("process %s is in state %s not shutting down", p.getName(), p.getStatusName())
+ 		// prevent pending process from running
+ 		if p.isOneOfStates(types.ProcessStatePending) {
+@@ -552,10 +715,17 @@ func (p *Process) stopProcess(withNoRestart bool) error {
+ 		}
+ 		return nil
+ 	}
+-	p.setState(types.ProcessStateTerminating)
++	if inc == nil {
++		// Running by its state alone, with no command behind it.
++		return nil
++	}
+ 	// if the process is interactive and running in the background, it might be blocked on writing to the pty
+-	// so we need to drain the pty to allow it to exit
+-	if ptyFile := p.command.GetPty(); ptyFile != nil {
++	// so we need to drain the pty to allow it to exit.
++	// Only an interactive process needs this: nothing else reads its terminal.
++	// The output of a tty process is being read into its log, and a second
++	// reader would throw away whatever it got to first - the very lines that
++	// say how the shutdown went.
++	if ptyFile := inc.cmd.GetPty(); ptyFile != nil && p.procConf.IsInteractive {
+ 		go func() {
+ 			_, _ = io.Copy(io.Discard, ptyFile)
+ 		}()
+@@ -565,37 +735,95 @@ func (p *Process) stopProcess(withNoRestart bool) error {
+ 		p.markWontBeReady()
+ 		p.cancelReadyLogFunc(fmt.Errorf("process %s was shut down", p.getName()))
+ 	}
+-	if isStringDefined(p.procConf.ShutDownParams.ShutDownCommand) {
+-		return p.doConfiguredStop(p.procConf.ShutDownParams)
++	params := p.procConf.ShutDownParams
++	if isStringDefined(params.ShutDownCommand) {
++		return p.doConfiguredStop(inc, params)
+ 	}
+-	if isStringDefined(p.procConf.ShutDownParams.SendKeys) {
+-		return p.doSendKeysStop(p.procConf.ShutDownParams)
++	if isStringDefined(params.SendKeys) {
++		return p.doSendKeysStop(inc, params)
+ 	}
+-	err := p.command.Stop(p.procConf.ShutDownParams.Signal, p.procConf.ShutDownParams.ParentOnly)
+-	if err != nil {
+-		log.Error().Err(err).Msgf("terminating %s failed", p.getName())
++	return p.gracefulShutDownWithSignal(inc, params)
++}
++
++// beginTerminating moves a running process to Terminating and returns the
++// launch that is to be stopped. It reports false, and changes nothing, when the
++// process is not running.
++//
++// Test and transition share one critical section. Done separately, a process
++// that ends in between has its final state overwritten with a Terminating that
++// nothing will ever move on from.
++func (p *Process) beginTerminating() (*incarnation, bool) {
++	p.stateMtx.Lock()
++	switch p.procState.Status {
++	case types.ProcessStateRunning, types.ProcessStateLaunched, types.ProcessStateLaunching:
++	default:
++		p.stateMtx.Unlock()
++		return nil, false
+ 	}
+-	if p.procConf.ShutDownParams.ShutDownTimeout != UndefinedShutdownTimeoutSec {
+-		return p.forceKillOnTimeout()
++	p.procState.Status = types.ProcessStateTerminating
++	p.onStateChange(types.ProcessStateTerminating)
++	ev := p.snapshotEventLocked()
++	inc := p.current
++	p.stateMtx.Unlock()
++	p.publishLocked(ev)
++	return inc, true
++}
++
++// currentIncarnation returns the latest launch of the process's command, or nil
++// if it was never launched.
++func (p *Process) currentIncarnation() *incarnation {
++	p.stateMtx.Lock()
++	defer p.stateMtx.Unlock()
++	return p.current
++}
++
++// signalIncarnation delivers sig to the launch being stopped. A process that is
++// already gone is not an error: there is nothing left to stop.
++func (p *Process) signalIncarnation(inc *incarnation, sig int, parentOnly bool) error {
++	if !parentOnly {
++		// Recorded before the signal goes out, so that the launch cannot be
++		// seen to exit without also being seen to have been signalled.
++		inc.groupSignalled.Store(true)
++	}
++	err := inc.cmd.Stop(sig, parentOnly)
++	if errors.Is(err, syscall.ESRCH) {
++		return nil
+ 	}
+ 	return err
+ }
+ 
++// forceKillOnTimeout waits for the current launch to stop and kills it if the
++// shutdown timeout expires first.
+ func (p *Process) forceKillOnTimeout() error {
+-	if p.waitForStopped(p.procConf.ShutDownParams.ShutDownTimeout) {
++	inc := p.currentIncarnation()
++	if inc == nil {
++		return nil
++	}
++	return p.forceKillIncarnationOnTimeout(inc)
++}
++
++func (p *Process) forceKillIncarnationOnTimeout(inc *incarnation) error {
++	if p.waitForStopped(inc, p.procConf.ShutDownParams.ShutDownTimeout) {
+ 		return nil
+ 	}
+ 	log.Debug().Msgf("process failed to shut down within %d seconds, sending %d", p.procConf.ShutDownParams.ShutDownTimeout, syscall.SIGKILL)
+-	return p.forceKill()
++	return p.forceKill(inc)
+ }
+ 
+-// waitForStopped waits up to timeout seconds for the process to end and reports
+-// whether it did. It waits on procDoneChan, which stays closed once the process
+-// has ended, so an exit that happens before the wait starts is not missed.
+-func (p *Process) waitForStopped(timeout int) bool {
++// waitForStopped waits up to timeout seconds for the given launch to be gone
++// and reports whether it is. Both channels stay closed once they fire, so an
++// exit that happens before the wait starts is not missed.
++//
++// The wait is tied to the launch rather than to the process as a whole. A
++// process that is restarted by its policy after being stopped - as on a failed
++// readiness probe - never ends, so waiting for the process would always run out
++// the timeout and then kill whatever is running by then: the replacement.
++func (p *Process) waitForStopped(inc *incarnation, timeout int) bool {
+ 	timer := time.NewTimer(time.Duration(timeout) * time.Second)
+ 	defer timer.Stop()
+ 	select {
++	case <-inc.exited:
++		return true
+ 	case <-p.procDoneChan:
+ 		return true
+ 	case <-timer.C:
+@@ -603,17 +831,13 @@ func (p *Process) waitForStopped(timeout int) bool {
+ 	}
+ }
+ 
+-// forceKill sends SIGKILL to the process group. ESRCH means there is nothing
+-// left to kill because the process exited just as the timeout expired.
+-func (p *Process) forceKill() error {
+-	err := p.command.Stop(int(syscall.SIGKILL), false)
+-	if errors.Is(err, syscall.ESRCH) {
+-		return nil
+-	}
+-	return err
++// forceKill sends SIGKILL to the launch's process group. A group that is
++// already gone exited just as the timeout expired.
++func (p *Process) forceKill(inc *incarnation) error {
++	return p.signalIncarnation(inc, int(syscall.SIGKILL), false)
+ }
+ 
+-func (p *Process) doConfiguredStop(params types.ShutDownParams) error {
++func (p *Process) doConfiguredStop(inc *incarnation, params types.ShutDownParams) error {
+ 	timeout := params.ShutDownTimeout
+ 	if timeout == UndefinedShutdownTimeoutSec {
+ 		timeout = DefaultShutdownTimeoutSec
+@@ -630,7 +854,7 @@ func (p *Process) doConfiguredStop(params types.ShutDownParams) error {
+ 	if err := cmd.Run(); err != nil {
+ 		// the process termination timedout and it will be killed
+ 		log.Error().Msgf("terminating %s with timeout %d failed - %s", p.getName(), timeout, err.Error())
+-		return p.command.Stop(int(syscall.SIGKILL), false)
++		return p.forceKill(inc)
+ 	}
+ 	return nil
+ }
+@@ -650,36 +874,173 @@ func (p *Process) sendKeys(s string) error {
+ // configured keys to the process's stdin and waits up to the shutdown timeout
+ // for the process to exit on its own. If it does not exit in time, it is killed
+ // with SIGKILL (mirroring the shutdown.command fallback behavior).
+-func (p *Process) doSendKeysStop(params types.ShutDownParams) error {
++func (p *Process) doSendKeysStop(inc *incarnation, params types.ShutDownParams) error {
+ 	if err := p.sendKeys(params.SendKeys); err != nil {
+ 		log.Error().Err(err).Msgf("failed to send keys to %s, falling back to signal", p.getName())
+-		return p.gracefulShutDownWithSignal(params)
++		return p.gracefulShutDownWithSignal(inc, params)
+ 	}
+ 	timeout := params.ShutDownTimeout
+ 	if timeout == UndefinedShutdownTimeoutSec {
+ 		timeout = DefaultShutdownTimeoutSec
+ 	}
+-	if p.waitForStopped(timeout) {
++	if p.waitForStopped(inc, timeout) {
+ 		return nil // exited gracefully in response to the keys
+ 	}
+ 	log.Debug().Msgf("process %s failed to exit on keys within %d seconds, sending %d", p.getName(), timeout, syscall.SIGKILL)
+-	return p.forceKill()
++	return p.forceKill(inc)
+ }
+ 
+ // gracefulShutDownWithSignal sends the configured signal and applies the
+-// SIGKILL-on-timeout fallback. It mirrors the default branch of stopProcess and
+-// is used when send_keys cannot be delivered.
+-func (p *Process) gracefulShutDownWithSignal(params types.ShutDownParams) error {
+-	err := p.command.Stop(params.Signal, params.ParentOnly)
++// SIGKILL-on-timeout fallback. It is the default way to stop a process, and the
++// fallback when send_keys cannot be delivered.
++func (p *Process) gracefulShutDownWithSignal(inc *incarnation, params types.ShutDownParams) error {
++	if p.isLaunchedDaemon(inc) {
++		return p.stopLaunchedDaemon(inc, params)
++	}
++	err := p.signalIncarnation(inc, params.Signal, params.ParentOnly)
+ 	if err != nil {
+ 		log.Error().Err(err).Msgf("terminating %s failed", p.getName())
+ 	}
+ 	if params.ShutDownTimeout != UndefinedShutdownTimeoutSec {
+-		return p.forceKillOnTimeout()
++		return p.forceKillIncarnationOnTimeout(inc)
+ 	}
+ 	return err
+ }
+ 
++// isLaunchedDaemon reports whether inc is a daemon whose launcher has exited,
++// leaving the daemon itself as the only thing there is to stop.
++func (p *Process) isLaunchedDaemon(inc *incarnation) bool {
++	if !p.procConf.IsDaemon {
++		return false
++	}
++	select {
++	case <-inc.exited:
++		return true
++	default:
++		return false
++	}
++}
++
++// isGroupGone reports whether the launch's process group is empty right now.
++func isGroupGone(inc *incarnation) bool {
++	ctx, cancel := context.WithCancel(context.Background())
++	cancel()
++	return inc.cmd.WaitGroupExit(ctx)
++}
++
++// checkStoppable reports an error when stopping the process could not possibly
++// have an effect, so that the request fails before anything is changed instead
++// of claiming a success that never happened.
++//
++// That is the case for a launched daemon without a shutdown command whose
++// process group is empty. The launcher is gone, and its process group is the
++// only handle left on what it started; a daemon that detached into a session of
++// its own - as daemons do - has left that group, and no signal of ours can
++// reach it. Reporting it as stopped would leave it running, port and all,
++// behind a state that says otherwise.
++func (p *Process) checkStoppable() error {
++	params := p.procConf.ShutDownParams
++	if !p.procConf.IsDaemon || isStringDefined(params.ShutDownCommand) {
++		return nil
++	}
++	p.stateMtx.Lock()
++	launched := p.procState.Status == types.ProcessStateLaunched
++	inc := p.current
++	p.stateMtx.Unlock()
++	if !launched || inc == nil {
++		return nil
++	}
++	// With parent_only only the launcher would be signalled, and it has exited.
++	if params.ParentOnly || isGroupGone(inc) {
++		return fmt.Errorf("%w: daemon %s is no longer in the process group of the command that launched it, "+
++			"and is still running. Define shutdown.command to stop it", errDaemonUnreachable, p.getName())
++	}
++	return nil
++}
++
++// kill ends the process at once, with no regard for its shutdown settings: its
++// whole process group gets SIGKILL. For when a graceful shutdown is not, or no
++// longer, an option.
++func (p *Process) kill() {
++	p.prepareForShutDown()
++	p.runCancelFn()
++	p.stateMtx.Lock()
++	pending := p.procState.Status == types.ProcessStatePending
++	inc := p.current
++	p.stateMtx.Unlock()
++	if pending {
++		// Never launched; the cancelled run context keeps it that way.
++		p.onProcessEnd(types.ProcessStateTerminating)
++		return
++	}
++	if inc != nil {
++		if err := p.forceKill(inc); err != nil {
++			log.Err(err).Msgf("failed to kill %s", p.getName())
++		}
++	}
++	// A daemon is beyond observation; this is all that can be done about it.
++	p.notifyDaemonStopped()
++}
++
++// abandonDaemon ends the bookkeeping for a daemon that cannot be stopped,
++// without pretending to have stopped it. Only for when process-compose itself
++// is going away and can no longer keep track of it.
++func (p *Process) abandonDaemon() {
++	p.runCancelFn()
++	p.notifyDaemonStopped()
++}
++
++// stopLaunchedDaemon stops a daemon that stayed in its launcher's process group
++// by signalling that group. The daemon counts as stopped only once the group is
++// seen to be empty - never on the strength of the signal having been sent.
++func (p *Process) stopLaunchedDaemon(inc *incarnation, params types.ShutDownParams) error {
++	if err := p.signalIncarnation(inc, params.Signal, false); err != nil {
++		log.Error().Err(err).Msgf("terminating %s failed", p.getName())
++		return err
++	}
++	if params.ShutDownTimeout == UndefinedShutdownTimeoutSec {
++		// Nothing is killed without a timeout, so there is no telling how long
++		// this takes. As with any other process the stop returns once the
++		// signal is out, and the state follows when the daemon is gone.
++		go p.completeDaemonWhenGone(inc)
++		return nil
++	}
++	if !waitForGroupGone(inc, time.Duration(params.ShutDownTimeout)*time.Second) {
++		log.Debug().Msgf("daemon %s failed to shut down within %d seconds, sending %d", p.getName(), params.ShutDownTimeout, syscall.SIGKILL)
++		if err := p.forceKill(inc); err != nil {
++			return err
++		}
++		if !waitForGroupGone(inc, groupExitGrace) {
++			return fmt.Errorf("daemon %s is still running after being killed", p.getName())
++		}
++	}
++	p.notifyDaemonStopped()
++	return nil
++}
++
++func waitForGroupGone(inc *incarnation, timeout time.Duration) bool {
++	ctx, cancel := context.WithTimeout(context.Background(), timeout)
++	defer cancel()
++	return inc.cmd.WaitGroupExit(ctx)
++}
++
++// completeDaemonWhenGone reports a signalled daemon as stopped once its process
++// group is empty, for as long as it is still the launch being stopped.
++func (p *Process) completeDaemonWhenGone(inc *incarnation) {
++	ticker := time.NewTicker(daemonExitPollInterval)
++	defer ticker.Stop()
++	for !isGroupGone(inc) {
++		select {
++		case <-p.procDoneChan:
++			return
++		case <-ticker.C:
++		}
++	}
++	if p.currentIncarnation() == inc {
++		p.notifyDaemonStopped()
++	}
++}
++
+ func (p *Process) isRunning() bool {
+ 	return p.isOneOfStates(
+ 		types.ProcessStateRunning,
+@@ -903,10 +1264,16 @@ func (p *Process) handleInput(pipe io.WriteCloser) {
+ 	}
+ }
+ 
+-func (p *Process) handleOutput(pipe io.ReadCloser, output string, handler func(message string), done chan struct{}) {
++func (p *Process) handleOutput(pipe io.ReadCloser, output string, handler func(message string), stream *outputStream) {
++	defer close(stream.done)
++	if stream.ownsPipe {
++		defer pipe.Close()
++	}
+ 	reader := bufio.NewReader(pipe)
+ 	for {
++		stream.blockedSince.Store(time.Now().UnixNano())
+ 		line, err := reader.ReadString('\n')
++		stream.blockedSince.Store(0)
+ 		if err != nil {
+ 			if err == io.EOF {
+ 				break
+@@ -930,7 +1297,6 @@ func (p *Process) handleOutput(pipe io.ReadCloser, output string, handler func(m
+ 		p.checkElevatedProcOutput(line)
+ 		handler(strings.TrimSuffix(line, "\n"))
+ 	}
+-	close(done)
+ }
+ 
+ func (p *Process) checkElevatedProcOutput(line string) {
+@@ -1047,6 +1413,15 @@ func (p *Process) getStatusName() string {
+ 
+ func (p *Process) setStateAndRun(state string, runnable func() error) error {
+ 	p.stateMtx.Lock()
++	// A stop cancels the run context first and looks at the state second, and
++	// it looks at the state under this same mutex. So either the cancellation
++	// is visible here and nothing is launched, or the stop is made to wait
++	// until the command is up and then finds it running. Checking anywhere
++	// else leaves a window in which a stopped process starts regardless.
++	if p.procRunCtx.Err() != nil {
++		p.stateMtx.Unlock()
++		return errStartAborted
++	}
+ 	p.procState.Status = state
+ 	p.onStateChange(state)
+ 	ev := p.snapshotEventLocked()
+diff --git a/src/app/project_runner.go b/src/app/project_runner.go
+index 986ca09..a203569 100644
+--- a/src/app/project_runner.go
++++ b/src/app/project_runner.go
+@@ -34,6 +34,18 @@ import (
+ // goroutine before the replacement instance is launched.
+ const pendingTerminationTimeout = 5 * time.Second
+ 
++// forceShutdownGrace is how long a forced shutdown waits for the processes it
++// killed to be gone.
++const forceShutdownGrace = 5 * time.Second
++
++// restartWaitNotice is how often a restart that is still waiting for the old
++// incarnation to exit says so.
++const restartWaitNotice = 10 * time.Second
++
++// errProjectShuttingDown is returned by a restart that was overtaken by the
++// shutdown of the whole project.
++var errProjectShuttingDown = errors.New("project is shutting down")
++
+ type ExitError struct {
+ 	Code int
+ }
+@@ -91,6 +103,14 @@ type ProjectRunner struct {
+ 	processWatcher       atomic.Pointer[watcher.Watcher]
+ 	stateBroadcaster     *ProcessStateBroadcaster
+ 	admitters            []admitter.Admitter
++	// shuttingDown is set once the project starts shutting down, whatever the
++	// reason. Guarded by exitCodeMutex: the process whose exit triggers the
++	// shutdown sets it together with the exit code, so that the code cannot be
++	// replaced by the processes the shutdown itself goes on to terminate.
++	shuttingDown bool
++	// shutdownCh is closed at the same moment, releasing whatever is waiting
++	// on a process that the shutdown is about to deal with anyway.
++	shutdownCh chan struct{}
+ }
+ 
+ // RestartCall represents an in-flight restart operation
+@@ -307,6 +327,15 @@ func (p *ProjectRunner) runProcess(config *types.ProcessConfig) {
+ 		withStatePublisher(p.publishProcessState),
+ 	)
+ 	p.addRunningProcess(process)
++	// Registered first, checked second. ShutDownProject raises the flag before
++	// it collects the processes to stop, so a launch either makes it into that
++	// collection or sees the flag here. In the other order a process started
++	// while the project shuts down would be missed by both, and would be left
++	// running after process-compose is gone.
++	if p.isShuttingDown() {
++		log.Debug().Msgf("Not starting %s: the project is shutting down", process.getName())
++		_ = process.shutDownNoRestart()
++	}
+ 	go func(proc *Process) {
+ 		defer proc.onTerminated()
+ 		if waitErr := p.waitIfNeeded(proc); waitErr != nil {
+@@ -422,19 +451,63 @@ func (p *ProjectRunner) onProcessEnd(exitCode int, procConf *types.ProcessConfig
+ 		if success {
+ 			code = 0
+ 		}
+-		p.exitCodeMutex.Lock()
+-		p.exitCode = code
+-		p.exitCodeMutex.Unlock()
++		if !p.beginShutdown(code) {
++			log.Debug().Msgf("Process %s exited with code %d while the project was shutting down", procConf.Name, exitCode)
++			return
++		}
+ 		log.Info().Msgf("Process %s exited with code %d. Shutting down project...", procConf.Name, exitCode)
+ 		_ = p.ShutDownProject()
+ 	}
+ }
+ 
++// beginShutdown marks the project as shutting down with the given exit code.
++// It reports false if a shutdown is already under way, in which case the exit
++// code is left alone.
++//
++// Only the first process to end the project decides its exit code. Everything
++// the shutdown then terminates exits non-zero as well - a SIGTERM'd process
++// reports 143 - and any of those carrying exit_on_failure or exit_on_end would
++// otherwise overwrite the code that actually caused the shutdown: the failing
++// test run reports 3, and the project exits with the status of a database that
++// was merely told to stop.
++func (p *ProjectRunner) beginShutdown(code int) bool {
++	p.exitCodeMutex.Lock()
++	defer p.exitCodeMutex.Unlock()
++	if p.shuttingDown {
++		return false
++	}
++	p.exitCode = code
++	p.markShuttingDownLocked()
++	return true
++}
++
++// markShuttingDown records that the project is shutting down without touching
++// its exit code: a shutdown somebody asked for is not a failure.
++func (p *ProjectRunner) markShuttingDown() {
++	p.exitCodeMutex.Lock()
++	defer p.exitCodeMutex.Unlock()
++	p.markShuttingDownLocked()
++}
++
++func (p *ProjectRunner) markShuttingDownLocked() {
++	if p.shuttingDown {
++		return
++	}
++	p.shuttingDown = true
++	close(p.shutdownCh)
++}
++
++func (p *ProjectRunner) isShuttingDown() bool {
++	p.exitCodeMutex.Lock()
++	defer p.exitCodeMutex.Unlock()
++	return p.shuttingDown
++}
++
+ func (p *ProjectRunner) onProcessSkipped(procConf *types.ProcessConfig) {
+ 	if procConf.RestartPolicy.ExitOnSkipped {
+-		p.exitCodeMutex.Lock()
+-		p.exitCode = 1
+-		p.exitCodeMutex.Unlock()
++		if !p.beginShutdown(1) {
++			return
++		}
+ 		log.Info().Msgf("Process %s skipped. Shutting down project...", procConf.Name)
+ 		_ = p.ShutDownProject()
+ 	}
+@@ -1064,18 +1137,26 @@ func (p *ProjectRunner) doRestart(name string, opts restartOpts) error {
+ 		err := proc.shutDownNoRestart()
+ 		if err != nil {
+ 			log.Err(err).Msgf("failed to stop process %s", name)
++			// It keeps running, so whenever it does end, that is its own doing.
++			proc.isRestarting.Store(false)
+ 			return err
+ 		}
+-		// A process that never started is still parked in waitIfNeeded. The
+-		// shutdown above releases it; wait for its goroutine to actually exit so
+-		// the replacement is the only incarnation in flight. Already started
+-		// processes are not waited for here - their shutdown honours the
+-		// configured shutdown parameters and can take arbitrarily long.
+-		if !proc.hasStarted() && !proc.waitUntilTerminated(pendingTerminationTimeout) {
+-			log.Warn().Msgf("process %s did not stop within %v, starting a new instance anyway", name, pendingTerminationTimeout)
++		if !proc.hasStarted() {
++			// A process that never started is still parked in waitIfNeeded. The
++			// shutdown above releases it; wait for its goroutine to actually
++			// exit so the replacement is the only incarnation in flight.
++			if !proc.waitUntilTerminated(pendingTerminationTimeout) {
++				log.Warn().Msgf("process %s did not stop within %v, starting a new instance anyway", name, pendingTerminationTimeout)
++			}
++		} else if err := p.waitForExit(proc); err != nil {
++			return fmt.Errorf("restart of %s abandoned: %w", name, err)
+ 		}
+ 		if !opts.skipBackoff {
+-			time.Sleep(proc.getBackoff())
++			select {
++			case <-time.After(proc.getBackoff()):
++			case <-p.shutdownCh:
++				return fmt.Errorf("restart of %s abandoned: %w", name, errProjectShuttingDown)
++			}
+ 		}
+ 	}
+ 
+@@ -1086,6 +1167,44 @@ func (p *ProjectRunner) doRestart(name string, opts restartOpts) error {
+ 	return p.launchUnlessStopped(name, epoch)
+ }
+ 
++// waitForExit blocks until a process that was told to stop is gone.
++//
++// Asking a process to stop only starts its shutdown: the signal has been sent,
++// and a server then takes its time draining connections and closing listeners.
++// Launching the replacement before that is over runs two incarnations side by
++// side, and the new one loses the race for everything the old one still holds -
++// most visibly its port, which is how a restart ends in "address already in
++// use". Backoff used to paper over this for manual restarts; a watch-triggered
++// restart skips backoff and so hit it every time the old incarnation needed
++// more than an instant.
++//
++// The wait has no timeout of its own, deliberately. How long a process may take
++// to stop is what shutdown.timeout_seconds is for, and when that is set the
++// process is killed at the deadline and this returns. Without it the process is
++// never killed, so the only alternative to waiting would be to start a second
++// copy next to a first one that is still running. The wait is given up only
++// when the whole project shuts down.
++func (p *ProjectRunner) waitForExit(proc *Process) error {
++	ticker := time.NewTicker(restartWaitNotice)
++	defer ticker.Stop()
++	start := time.Now()
++	for {
++		select {
++		case <-proc.procTerminatedChan:
++			return nil
++		case <-p.shutdownCh:
++			return errProjectShuttingDown
++		case <-ticker.C:
++			hint := ""
++			if proc.procConf.ShutDownParams.ShutDownTimeout == UndefinedShutdownTimeoutSec {
++				hint = "; set shutdown.timeout_seconds to have it killed when it takes too long"
++			}
++			log.Warn().Msgf("Still waiting for %s to stop before restarting it (%v)%s",
++				proc.getName(), time.Since(start).Round(time.Second), hint)
++		}
++	}
++}
++
+ // launchUnlessStopped starts the replacement incarnation unless a stop was
+ // requested for the process since epoch, in which case the restart is dropped
+ // and the process stays down.
+@@ -1101,6 +1220,9 @@ func (p *ProjectRunner) launchUnlessStopped(name string, epoch uint64) error {
+ 		log.Debug().Msgf("Restart of %s abandoned: it was stopped while restarting", name)
+ 		return nil
+ 	}
++	if p.isShuttingDown() {
++		return fmt.Errorf("restart of %s abandoned: %w", name, errProjectShuttingDown)
++	}
+ 
+ 	processConfig, ok := p.project.Processes[name]
+ 	if !ok {
+@@ -1221,25 +1343,41 @@ func (p *ProjectRunner) shutDownInOrder(wg *sync.WaitGroup, shutdownOrder []*Pro
+ 			waitForDepsWg.Wait()
+ 			log.Debug().Msgf("[%s]: waited for all dependencies to shut down", proc.getName())
+ 
+-			err := proc.shutDown()
+-			if err != nil {
+-				log.Err(err).Msgf("failed to shutdown %s", proc.getName())
+-				return
++			if p.shutDownForExit(proc) {
++				proc.waitForCompletion()
+ 			}
+-			proc.waitForCompletion()
+ 		}(process)
+ 	}
+ }
+ 
++// shutDownForExit stops a process as part of shutting the project down, and
++// reports whether its completion can be waited for.
++//
++// A daemon that cannot be reached is left running - there is nothing else to
++// do with it - but it is let go of rather than waited for indefinitely:
++// process-compose is about to exit, and anything ordered after it must not
++// hang on a stop that will never come.
++func (p *ProjectRunner) shutDownForExit(proc *Process) bool {
++	err := proc.shutDown()
++	if errors.Is(err, errDaemonUnreachable) {
++		log.Warn().Err(err).Msgf("Leaving %s running", proc.getName())
++		proc.abandonDaemon()
++		return true
++	}
++	if err != nil {
++		log.Err(err).Msgf("failed to shutdown %s", proc.getName())
++		return false
++	}
++	return true
++}
++
+ func (p *ProjectRunner) shutDownAndWait(shutdownOrder []*Process) {
+ 	wg := sync.WaitGroup{}
+ 	if p.isOrderedShutdown {
+ 		p.shutDownInOrder(&wg, shutdownOrder)
+ 	} else {
+ 		for _, proc := range shutdownOrder {
+-			err := proc.shutDown()
+-			if err != nil {
+-				log.Err(err).Msgf("failed to shutdown %s", proc.getName())
++			if !p.shutDownForExit(proc) {
+ 				continue
+ 			}
+ 			wg.Add(1)
+@@ -1254,6 +1392,11 @@ func (p *ProjectRunner) shutDownAndWait(shutdownOrder []*Process) {
+ }
+ 
+ func (p *ProjectRunner) ShutDownProject() error {
++	// First of all, so that nothing started from here on can slip past the
++	// shutdown, restarts waiting on a process give up, and the processes about
++	// to be terminated do not pass their exit codes off as the project's.
++	p.markShuttingDown()
++
+ 	// Stop watching before anything is torn down: a file touched by a
+ 	// shutdown.command must not trigger a restart of a process that is already
+ 	// on its way out.
+@@ -1293,6 +1436,42 @@ func (p *ProjectRunner) ShutDownProject() error {
+ 	return nil
+ }
+ 
++// ForceShutDownProject kills every process outright and ends the project with
++// the given exit code, unless one has been set already.
++//
++// It is the way out of a graceful shutdown that does not finish: a process that
++// ignores its stop signal and has no shutdown timeout is waited for
++// indefinitely, and the only alternative to killing it is to abandon it.
++func (p *ProjectRunner) ForceShutDownProject(exitCode int) {
++	p.markShuttingDown()
++	p.exitCodeMutex.Lock()
++	if p.exitCode == 0 {
++		p.exitCode = exitCode
++	}
++	p.exitCodeMutex.Unlock()
++
++	p.runProcMutex.Lock()
++	procs := make([]*Process, 0, len(p.runningProcesses))
++	for _, proc := range p.runningProcesses {
++		procs = append(procs, proc)
++	}
++	p.runProcMutex.Unlock()
++
++	log.Warn().Msgf("Killing %d running process(es)", len(procs))
++	for _, proc := range procs {
++		proc.kill()
++	}
++	// Give them the moment it takes to die, so that what they held - ports
++	// above all - is free again by the time process-compose has exited.
++	deadline := time.Now().Add(forceShutdownGrace)
++	for _, proc := range procs {
++		if !proc.waitUntilTerminated(time.Until(deadline)) {
++			log.Error().Msgf("Process %s is still running after being killed", proc.getName())
++		}
++	}
++	p.cancelAppFn()
++}
++
+ func (p *ProjectRunner) WaitForProjectShutdown() {
+ 	if p.ctxApp != nil {
+ 		if !p.isTuiOn {
+@@ -1750,6 +1929,7 @@ func NewProjectRunner(opts *ProjectOpts) (*ProjectRunner, error) {
+ 			Version:   config.Version,
+ 		},
+ 		procCompleteChannel: make(chan int, 128),
++		shutdownCh:          make(chan struct{}),
+ 	}
+ 
+ 	name, err := runner.GetProjectName()
+diff --git a/src/app/run_main_process_unix_test.go b/src/app/run_main_process_unix_test.go
+new file mode 100644
+index 0000000..12a37e1
+--- /dev/null
++++ b/src/app/run_main_process_unix_test.go
+@@ -0,0 +1,150 @@
++//go:build !windows
++
++package app
++
++import (
++	"errors"
++	"os"
++	"os/exec"
++	"path/filepath"
++	"syscall"
++	"testing"
++	"time"
++
++	"github.com/f1bonacc1/process-compose/src/command"
++	"github.com/f1bonacc1/process-compose/src/types"
++)
++
++const (
++	// mainProcessHelperEnv selects the scenario the re-executed test binary
++	// plays out in place of `process-compose run tests`.
++	mainProcessHelperEnv = "PC_TEST_MAIN_PROCESS_SCENARIO"
++	// heartbeatEnv names the file a child of the foreground process keeps
++	// appending to for as long as it is alive.
++	heartbeatEnv = "PC_TEST_HEARTBEAT"
++)
++
++var mainProcessScenarios = map[string]struct {
++	db       string
++	tests    string
++	wantCode int
++}{
++	// A dependency fails while the foreground process is still running.
++	// The foreground process has a child of its own, which does not die with
++	// it unless it is stopped as well.
++	"dependency fails": {
++		db:       "sleep 0.5; exit 4",
++		tests:    `(while :; do echo beat >> "$` + heartbeatEnv + `"; sleep 0.05; done) & wait`,
++		wantCode: 4,
++	},
++	// The foreground process fails; the dependency is torn down with it.
++	"foreground fails": {db: "sleep 60 & wait", tests: "sleep 0.5; exit 3", wantCode: 3},
++	// The foreground process succeeds.
++	"foreground succeeds": {db: "sleep 60 & wait", tests: "sleep 0.5", wantCode: 0},
++}
++
++// The foreground process of `process-compose run` shares process-compose's own
++// process group, so that it keeps the terminal. Shutting the project down must
++// stop that process and its children without signalling the group itself:
++// doing so terminates process-compose and the script that launched it, which
++// then never sees the exit code nor gets to run its clean-up.
++//
++// The scenario runs in a re-executed copy of the test binary with a process
++// group of its own, standing in for process-compose, so that a stray group
++// signal shows up as that copy being killed rather than taking the test run
++// down.
++func TestRunDoesNotSignalItsOwnProcessGroup(t *testing.T) {
++	if scenario := os.Getenv(mainProcessHelperEnv); scenario != "" {
++		runMainProcessScenario(scenario)
++		return
++	}
++	for name, scenario := range mainProcessScenarios {
++		t.Run(name, func(t *testing.T) {
++			heartbeat := filepath.Join(t.TempDir(), "heartbeat")
++			helper := exec.Command(os.Args[0], "-test.run=^TestRunDoesNotSignalItsOwnProcessGroup$")
++			helper.Env = append(os.Environ(), mainProcessHelperEnv+"="+name, heartbeatEnv+"="+heartbeat)
++			helper.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
++			if err := helper.Start(); err != nil {
++				t.Fatal(err)
++			}
++			pgid := helper.Process.Pid
++			t.Cleanup(func() { _ = syscall.Kill(-pgid, syscall.SIGKILL) })
++
++			// The outcome is read from the process state below; Wait's error only
++			// restates a non-zero exit.
++			done := make(chan struct{})
++			go func() {
++				defer close(done)
++				_ = helper.Wait()
++			}()
++			select {
++			case <-done:
++			case <-time.After(30 * time.Second):
++				t.Fatal("project did not exit")
++			}
++
++			status, ok := helper.ProcessState.Sys().(syscall.WaitStatus)
++			if !ok {
++				t.Fatalf("unexpected process state %v", helper.ProcessState)
++			}
++			if status.Signaled() {
++				t.Fatalf("process-compose was killed by %v: stopping the foreground process signalled its own process group",
++					status.Signal())
++			}
++			if got := status.ExitStatus(); got != scenario.wantCode {
++				t.Errorf("exit code = %d, want %d", got, scenario.wantCode)
++			}
++
++			// The children of the foreground process have to be stopped along
++			// with it. Judged by what they do rather than by whether their PIDs
++			// are gone: an exited child stays around unreaped for as long as
++			// the system's init leaves it there.
++			before := countLinesIn(t, heartbeat)
++			time.Sleep(500 * time.Millisecond)
++			if after := countLinesIn(t, heartbeat); after != before {
++				t.Errorf("a child of the foreground process is still running after the project exited (%d beats since)", after-before)
++			}
++		})
++	}
++}
++
++func runMainProcessScenario(name string) {
++	scenario, ok := mainProcessScenarios[name]
++	if !ok {
++		os.Exit(99)
++	}
++	shell := command.DefaultShellConfig()
++	runner, err := NewProjectRunner(&ProjectOpts{
++		mainProcess: "tests",
++		project: &types.Project{
++			ShellConfig: shell,
++			Processes: map[string]types.ProcessConfig{
++				"db": {
++					Name:          "db",
++					ReplicaName:   "db",
++					Executable:    shell.ShellCommand,
++					Args:          []string{shell.ShellArgument, scenario.db},
++					RestartPolicy: types.RestartPolicyConfig{Restart: types.RestartPolicyExitOnFailure},
++				},
++				"tests": {
++					Name:        "tests",
++					ReplicaName: "tests",
++					Executable:  shell.ShellCommand,
++					Args:        []string{shell.ShellArgument, scenario.tests},
++				},
++			},
++		},
++	})
++	if err != nil {
++		os.Exit(98)
++	}
++	err = runner.Run()
++	var exitErr *ExitError
++	if errors.As(err, &exitErr) {
++		os.Exit(exitErr.Code)
++	}
++	if err != nil {
++		os.Exit(97)
++	}
++	os.Exit(0)
++}
+diff --git a/src/app/stop_restart_stability_test.go b/src/app/stop_restart_stability_test.go
+new file mode 100644
+index 0000000..59463a4
+--- /dev/null
++++ b/src/app/stop_restart_stability_test.go
+@@ -0,0 +1,724 @@
++package app
++
++import (
++	"errors"
++	"fmt"
++	"os"
++	"path/filepath"
++	"runtime"
++	"strings"
++	"syscall"
++	"testing"
++	"time"
++
++	"github.com/f1bonacc1/process-compose/src/command"
++	"github.com/f1bonacc1/process-compose/src/health"
++	"github.com/f1bonacc1/process-compose/src/pclog"
++	"github.com/f1bonacc1/process-compose/src/types"
++)
++
++// slowStopServer writes a script standing in for a server that owns an
++// exclusive resource - a port, in real life - and takes a while to give it up
++// when asked to stop. The resource is a lock directory: a second copy started
++// while the first still holds it records a CONFLICT, the way a real server
++// would fail with "address already in use".
++func slowStopServer(t *testing.T, dir string) (script, events string) {
++	t.Helper()
++	lock := filepath.Join(dir, "port.lock")
++	events = filepath.Join(dir, "events")
++	script = filepath.Join(dir, "server.sh")
++	body := fmt.Sprintf(`trap 'sleep 0.6; rmdir %[1]q; exit 0' TERM
++if ! mkdir %[1]q 2>/dev/null; then
++  echo CONFLICT >> %[2]q
++  exit 98
++fi
++echo up >> %[2]q
++while :; do sleep 0.05; done
++`, lock, events)
++	if err := os.WriteFile(script, []byte(body), 0o600); err != nil {
++		t.Fatal(err)
++	}
++	return script, events
++}
++
++func readEvents(t *testing.T, path string) string {
++	t.Helper()
++	data, err := os.ReadFile(path)
++	if err != nil && !errors.Is(err, os.ErrNotExist) {
++		t.Fatal(err)
++	}
++	return string(data)
++}
++
++// A restart must not launch the replacement while the old incarnation is still
++// shutting down, or the two fight over whatever the old one has yet to release.
++//
++// The watch path is the one exercised: it skips backoff, so nothing but an
++// explicit wait stands between the stop signal and the relaunch.
++func TestRestartWaitsForOldIncarnationToExit(t *testing.T) {
++	if runtime.GOOS == "windows" {
++		t.Skip("relies on Unix signals")
++	}
++	shell := command.DefaultShellConfig()
++	const name = "api"
++
++	tests := []struct {
++		name string
++		// cmd builds the process command from the server script.
++		cmd func(script string) string
++	}{
++		{
++			// The server is the command: its own exit is what has to be awaited.
++			name: "server is the command",
++			cmd:  func(script string) string { return "exec bash " + script },
++		},
++		{
++			// The server runs under a shell that dies on SIGTERM at once and
++			// leaves it behind, as `npm run`, a `cd x && server` one-liner or
++			// any launcher script does. The command is gone long before the
++			// server is; only its process group tells.
++			name: "server is behind a wrapper",
++			cmd:  func(script string) string { return "bash " + script + "; true" },
++		},
++	}
++	for _, tt := range tests {
++		t.Run(tt.name, func(t *testing.T) {
++			script, events := slowStopServer(t, t.TempDir())
++			runner, err := NewProjectRunner(&ProjectOpts{
++				project: &types.Project{
++					ShellConfig: shell,
++					Processes: map[string]types.ProcessConfig{
++						name: {
++							Name:        name,
++							ReplicaName: name,
++							Executable:  shell.ShellCommand,
++							Args:        []string{shell.ShellArgument, tt.cmd(script)},
++						},
++					},
++				},
++			})
++			if err != nil {
++				t.Fatal(err)
++			}
++			go func() { _ = runner.Run() }()
++			t.Cleanup(func() { _ = runner.ShutDownProject() })
++
++			if !waitForLineCount(t, events, 1, 10*time.Second) {
++				t.Fatalf("server never came up; events: %q", readEvents(t, events))
++			}
++
++			const restarts = 3
++			for i := range restarts {
++				if err := runner.RestartProcesses([]string{name}); err != nil {
++					t.Fatalf("restart %d: %v", i+1, err)
++				}
++				if !waitForLineCount(t, events, i+2, 10*time.Second) {
++					t.Fatalf("restart %d never brought the server back; events: %q", i+1, readEvents(t, events))
++				}
++			}
++
++			got := readEvents(t, events)
++			if strings.Contains(got, "CONFLICT") {
++				t.Errorf("a replacement was launched while the old incarnation was still running; events: %q", got)
++			}
++			if ups := strings.Count(got, "up\n"); ups != restarts+1 {
++				t.Errorf("server came up %d times, want %d; events: %q", ups, restarts+1, got)
++			}
++		})
++	}
++}
++
++// A restart that is waiting for a process to stop must give up when the project
++// shuts down, rather than hold the shutdown hostage - and must not launch
++// anything once it has.
++func TestRestartWaitEndsWhenProjectShutsDown(t *testing.T) {
++	if runtime.GOOS == "windows" {
++		t.Skip("relies on Unix signals")
++	}
++	shell := command.DefaultShellConfig()
++	const name = "stubborn"
++	marker := filepath.Join(t.TempDir(), "starts")
++
++	runner, err := NewProjectRunner(&ProjectOpts{
++		project: &types.Project{
++			ShellConfig: shell,
++			Processes: map[string]types.ProcessConfig{
++				name: {
++					Name:        name,
++					ReplicaName: name,
++					Executable:  shell.ShellCommand,
++					// Ignores SIGTERM and has no shutdown timeout: it never stops.
++					Args: []string{shell.ShellArgument,
++						fmt.Sprintf("trap '' TERM; echo up >> %q; while :; do sleep 0.05; done", marker)},
++				},
++			},
++		},
++	})
++	if err != nil {
++		t.Fatal(err)
++	}
++	go func() { _ = runner.Run() }()
++	if !waitForLineCount(t, marker, 1, 10*time.Second) {
++		t.Fatal("process never started")
++	}
++	proc := runner.getRunningProcess(name)
++	if proc == nil {
++		t.Fatal("process is not registered")
++	}
++	t.Cleanup(func() { _ = proc.command.Stop(int(syscall.SIGKILL), false) })
++
++	restarted := make(chan error, 1)
++	go func() { restarted <- runner.RestartProcess(name) }()
++
++	select {
++	case err := <-restarted:
++		t.Fatalf("restart returned (%v) although the old incarnation is still running", err)
++	case <-time.After(500 * time.Millisecond):
++	}
++
++	runner.markShuttingDown()
++	select {
++	case err := <-restarted:
++		if !errors.Is(err, errProjectShuttingDown) {
++			t.Errorf("restart returned %v, want %v", err, errProjectShuttingDown)
++		}
++	case <-time.After(5 * time.Second):
++		t.Fatal("restart is still waiting after the project began shutting down")
++	}
++	if got := countLinesIn(t, marker); got != 1 {
++		t.Errorf("process was launched %d times, want 1", got)
++	}
++}
++
++// A process started while the project is shutting down must not be left running
++// behind it.
++func TestNoLaunchDuringShutdown(t *testing.T) {
++	shell := command.DefaultShellConfig()
++	const (
++		running = "running"
++		late    = "late"
++	)
++	runner, err := NewProjectRunner(&ProjectOpts{
++		project: &types.Project{
++			ShellConfig: shell,
++			Processes: map[string]types.ProcessConfig{
++				running: {
++					Name:        running,
++					ReplicaName: running,
++					Executable:  shell.ShellCommand,
++					Args:        []string{shell.ShellArgument, getSleepCommand(60)},
++				},
++				late: {
++					Name:        late,
++					ReplicaName: late,
++					Disabled:    true,
++					Executable:  shell.ShellCommand,
++					Args:        []string{shell.ShellArgument, getSleepCommand(60)},
++				},
++			},
++		},
++	})
++	if err != nil {
++		t.Fatal(err)
++	}
++	go func() { _ = runner.Run() }()
++	t.Cleanup(func() { _ = runner.ShutDownProject() })
++	waitForProcessState(t, runner, running, types.ProcessStateRunning, 10*time.Second)
++
++	runner.markShuttingDown()
++	if err := runner.StartProcess(late); err != nil {
++		t.Fatalf("start: %v", err)
++	}
++	if !waitForProcessDeregistered(runner, late, 10*time.Second) {
++		t.Fatal("a process started during shutdown is still registered")
++	}
++	state, err := runner.GetProcessState(late)
++	if err != nil {
++		t.Fatal(err)
++	}
++	if state.Pid != 0 {
++		t.Errorf("a process started during shutdown was launched with pid %d", state.Pid)
++	}
++}
++
++// A command that exits is done, even if something it started still holds its
++// output open. The exit must not be missed, and what depends on it must start.
++func TestProcessCompletesWhileItsOutputIsHeldOpen(t *testing.T) {
++	if runtime.GOOS == "windows" {
++		t.Skip("relies on Unix process semantics")
++	}
++	shell := command.DefaultShellConfig()
++	const (
++		migrate = "migrate"
++		api     = "api"
++	)
++	runner, err := NewProjectRunner(&ProjectOpts{
++		project: &types.Project{
++			ShellConfig: shell,
++			LogLength:   100,
++			Processes: map[string]types.ProcessConfig{
++				migrate: {
++					Name:        migrate,
++					ReplicaName: migrate,
++					Executable:  shell.ShellCommand,
++					// The helper inherits stdout and stderr and outlives the
++					// migration by far.
++					Args: []string{shell.ShellArgument, "echo migrating; sleep 60 & echo migrated"},
++				},
++				api: {
++					Name:        api,
++					ReplicaName: api,
++					Executable:  shell.ShellCommand,
++					Args:        []string{shell.ShellArgument, getSleepCommand(60)},
++					DependsOn: types.DependsOnConfig{
++						migrate: {Condition: types.ProcessConditionCompletedSuccessfully},
++					},
++				},
++			},
++		},
++	})
++	if err != nil {
++		t.Fatal(err)
++	}
++	go func() { _ = runner.Run() }()
++	t.Cleanup(func() { _ = runner.ShutDownProject() })
++
++	waitForProcessLaunched(t, runner, migrate, 10*time.Second)
++	proc := runner.getRunningProcess(migrate)
++	if proc != nil {
++		// The helper is not ours to stop; reap it by hand once the test is over.
++		t.Cleanup(func() { _ = proc.command.Stop(int(syscall.SIGKILL), false) })
++	}
++
++	waitForProcessState(t, runner, migrate, types.ProcessStateCompleted, 10*time.Second)
++	waitForProcessState(t, runner, api, types.ProcessStateRunning, 10*time.Second)
++
++	state, err := runner.GetProcessState(migrate)
++	if err != nil {
++		t.Fatal(err)
++	}
++	if state.ExitCode != 0 {
++		t.Errorf("migrate exit code = %d, want 0", state.ExitCode)
++	}
++	logs, err := runner.GetProcessLog(migrate, 0, 0)
++	if err != nil {
++		t.Fatal(err)
++	}
++	if joined := strings.Join(logs, "\n"); !strings.Contains(joined, "migrating") || !strings.Contains(joined, "migrated") {
++		t.Errorf("output written before the exit was not captured, got %q", logs)
++	}
++}
++
++// The project exits with the code of the process that ended it. The processes
++// terminated by the resulting shutdown exit non-zero too, and must not replace
++// that code with their own.
++func TestProjectExitCodeIsNotReplacedDuringShutdown(t *testing.T) {
++	if runtime.GOOS == "windows" {
++		t.Skip("uses POSIX shell syntax")
++	}
++	shell := command.DefaultShellConfig()
++	tests := []struct {
++		name     string
++		testsCmd string
++		wantCode int
++	}{
++		{name: "failing run", testsCmd: "sleep 0.3; exit 3", wantCode: 3},
++		{name: "passing run", testsCmd: "sleep 0.3; exit 0", wantCode: 0},
++	}
++	for _, tt := range tests {
++		t.Run(tt.name, func(t *testing.T) {
++			processes := map[string]types.ProcessConfig{
++				"tests": {
++					Name:          "tests",
++					ReplicaName:   "tests",
++					Executable:    shell.ShellCommand,
++					Args:          []string{shell.ShellArgument, tt.testsCmd},
++					RestartPolicy: types.RestartPolicyConfig{ExitOnEnd: true},
++				},
++			}
++			// Services that are torn down with the project. Each carries a
++			// policy under which its own exit ends the project.
++			for _, svc := range []struct {
++				name   string
++				policy types.RestartPolicyConfig
++			}{
++				{"db", types.RestartPolicyConfig{Restart: types.RestartPolicyExitOnFailure}},
++				{"cache", types.RestartPolicyConfig{ExitOnEnd: true}},
++			} {
++				processes[svc.name] = types.ProcessConfig{
++					Name:          svc.name,
++					ReplicaName:   svc.name,
++					Executable:    shell.ShellCommand,
++					Args:          []string{shell.ShellArgument, getSleepCommand(60)},
++					RestartPolicy: svc.policy,
++				}
++			}
++			runner, err := NewProjectRunner(&ProjectOpts{
++				project: &types.Project{ShellConfig: shell, Processes: processes},
++			})
++			if err != nil {
++				t.Fatal(err)
++			}
++
++			done := make(chan error, 1)
++			go func() { done <- runner.Run() }()
++			var runErr error
++			select {
++			case runErr = <-done:
++			case <-time.After(20 * time.Second):
++				_ = runner.ShutDownProject()
++				t.Fatal("project did not exit")
++			}
++
++			gotCode := 0
++			var exitErr *ExitError
++			if errors.As(runErr, &exitErr) {
++				gotCode = exitErr.Code
++			} else if runErr != nil {
++				t.Fatalf("unexpected error: %v", runErr)
++			}
++			if gotCode != tt.wantCode {
++				t.Errorf("project exit code = %d, want %d", gotCode, tt.wantCode)
++			}
++		})
++	}
++}
++
++// A shutdown somebody asked for is not a failure, even though the processes it
++// terminates exit non-zero and are configured to end the project when they do.
++func TestRequestedShutdownExitsCleanly(t *testing.T) {
++	shell := command.DefaultShellConfig()
++	const name = "db"
++	runner, err := NewProjectRunner(&ProjectOpts{
++		project: &types.Project{
++			ShellConfig: shell,
++			Processes: map[string]types.ProcessConfig{
++				name: {
++					Name:          name,
++					ReplicaName:   name,
++					Executable:    shell.ShellCommand,
++					Args:          []string{shell.ShellArgument, getSleepCommand(60)},
++					RestartPolicy: types.RestartPolicyConfig{Restart: types.RestartPolicyExitOnFailure},
++				},
++			},
++		},
++	})
++	if err != nil {
++		t.Fatal(err)
++	}
++	done := make(chan error, 1)
++	go func() { done <- runner.Run() }()
++	waitForProcessState(t, runner, name, types.ProcessStateRunning, 10*time.Second)
++
++	if err := runner.ShutDownProject(); err != nil {
++		t.Fatal(err)
++	}
++	select {
++	case err := <-done:
++		if err != nil {
++			t.Errorf("project exited with %v after a requested shutdown, want a clean exit", err)
++		}
++	case <-time.After(20 * time.Second):
++		t.Fatal("project did not exit")
++	}
++}
++
++// A process killed by a signal reports 128+signal, as documented and as a shell
++// would, instead of -1.
++func TestSignalledProcessExitCode(t *testing.T) {
++	if runtime.GOOS == "windows" {
++		t.Skip("relies on Unix signals")
++	}
++	shell := command.DefaultShellConfig()
++	tests := []struct {
++		name string
++		cmd  string
++		want int
++	}{
++		{name: "killed by SIGKILL", cmd: "kill -KILL $$", want: 128 + int(syscall.SIGKILL)},
++		{name: "killed by SIGTERM", cmd: "kill -TERM $$", want: 128 + int(syscall.SIGTERM)},
++		{name: "plain exit", cmd: "exit 7", want: 7},
++	}
++	for _, tt := range tests {
++		t.Run(tt.name, func(t *testing.T) {
++			proc := NewProcess(
++				withProcConf(&types.ProcessConfig{
++					Name:        "p",
++					ReplicaName: "p",
++					Executable:  shell.ShellCommand,
++					Args:        []string{shell.ShellArgument, tt.cmd},
++				}),
++				withLogger(pclog.NewNilLogger()),
++				withProcState(&types.ProcessState{}),
++				withProcLog(pclog.NewLogBuffer(10)),
++			)
++			if got := proc.run(); got != tt.want {
++				t.Errorf("exit code = %d, want %d", got, tt.want)
++			}
++		})
++	}
++}
++
++// Stopping a process with a shutdown timeout arms a SIGKILL for when the
++// timeout expires. When the process is then restarted by its policy - a failed
++// readiness probe is the case here - that SIGKILL belongs to the launch that
++// was stopped, and must not land on its replacement.
++func TestStopTimeoutDoesNotKillReplacement(t *testing.T) {
++	if runtime.GOOS == "windows" {
++		t.Skip("relies on Unix signals")
++	}
++	launches := filepath.Join(t.TempDir(), "launches")
++	proc := &types.ProcessConfig{
++		Name:        "svc",
++		ReplicaName: "svc",
++		Command:     fmt.Sprintf("echo launched >> %q; exec sleep 60", launches),
++		RestartPolicy: types.RestartPolicyConfig{
++			Restart:        types.RestartPolicyAlways,
++			BackoffSeconds: 1,
++		},
++		ShutDownParams: types.ShutDownParams{ShutDownTimeout: 2},
++		// Fails for the first launch only.
++		ReadinessProbe: &health.Probe{
++			Exec: &health.ExecProbe{
++				Command: fmt.Sprintf("test $(wc -l < %q) -ge 2", launches),
++			},
++			FailureThreshold: 1,
++			PeriodSeconds:    1,
++			InitialDelay:     1,
++		},
++	}
++	shell := command.DefaultShellConfig()
++	proc.AssignProcessExecutableAndArgs(shell, "")
++
++	p := NewProcess(
++		withProcConf(proc),
++		// The probe runs through the shell as well.
++		withShellConfig(*shell),
++		withLogger(pclog.NewNilLogger()),
++		withProcState(&types.ProcessState{}),
++		withProcLog(pclog.NewLogBuffer(100)),
++	)
++	finished := make(chan struct{})
++	go func() {
++		defer close(finished)
++		_ = p.run()
++	}()
++	t.Cleanup(func() {
++		_ = p.shutDownNoRestart()
++		<-finished
++	})
++
++	if !waitForLineCount(t, launches, 2, 15*time.Second) {
++		t.Fatalf("process was not restarted by its readiness probe; launches: %d", countLinesIn(t, launches))
++	}
++	// Well past the shutdown timeout of the launch that was stopped.
++	time.Sleep(4 * time.Second)
++	if got := countLinesIn(t, launches); got != 2 {
++		t.Errorf("process was launched %d times, want 2: the replacement was killed", got)
++	}
++	if restarts := p.getState().Restarts; restarts != 1 {
++		t.Errorf("restarts = %d, want 1", restarts)
++	}
++}
++
++// Once a stop has been requested, the process must not be launched - however
++// narrowly the request beat the launch.
++func TestStartIsAbortedByAnEarlierStop(t *testing.T) {
++	p := NewProcess(
++		withProcConf(&types.ProcessConfig{Name: "p", ReplicaName: "p"}),
++		withLogger(pclog.NewNilLogger()),
++		withProcState(&types.ProcessState{Status: types.ProcessStatePending}),
++		withProcLog(pclog.NewLogBuffer(10)),
++	)
++	p.runCancelFn()
++
++	launched := false
++	err := p.setStateAndRun(types.ProcessStateRunning, func() error {
++		launched = true
++		return nil
++	})
++	if !errors.Is(err, errStartAborted) {
++		t.Errorf("err = %v, want %v", err, errStartAborted)
++	}
++	if launched {
++		t.Error("the command was launched after the process had been stopped")
++	}
++	if status := p.getStatusName(); status != types.ProcessStatePending {
++		t.Errorf("status = %s, want it left at %s", status, types.ProcessStatePending)
++	}
++}
++
++// Stopping a process that has just ended must leave its final state alone.
++func TestStopDoesNotOverwriteAFinalState(t *testing.T) {
++	p := NewProcess(
++		withProcConf(&types.ProcessConfig{Name: "p", ReplicaName: "p"}),
++		withLogger(pclog.NewNilLogger()),
++		withProcState(&types.ProcessState{Status: types.ProcessStateCompleted}),
++		withProcLog(pclog.NewLogBuffer(10)),
++	)
++	if err := p.shutDownNoRestart(); err != nil {
++		t.Fatal(err)
++	}
++	if status := p.getStatusName(); status != types.ProcessStateCompleted {
++		t.Errorf("status = %s, want %s", status, types.ProcessStateCompleted)
++	}
++	if _, running := p.beginTerminating(); running {
++		t.Error("a completed process was moved to Terminating")
++	}
++}
++
++// A process with `is_tty` runs on a terminal so that it colours its output. It
++// must be stopped like any other process: what it writes while shutting down
++// belongs in its log, it receives the configured signal, and it reports its own
++// exit code.
++func TestTtyProcessShutdownOutputAndExitCode(t *testing.T) {
++	if runtime.GOOS == "windows" {
++		t.Skip("PTYs are not supported on Windows")
++	}
++	shell := command.DefaultShellConfig()
++	const name = "frontend"
++	script := `trap 'echo got TERM; sleep 0.2; echo cleaning up; sleep 0.2; echo bye; exit 0' TERM
++trap 'echo got HUP; exit 7' HUP
++echo ready
++while :; do sleep 0.05; done`
++
++	runner, err := NewProjectRunner(&ProjectOpts{
++		project: &types.Project{
++			ShellConfig: shell,
++			LogLength:   100,
++			Processes: map[string]types.ProcessConfig{
++				name: {
++					Name:        name,
++					ReplicaName: name,
++					IsTty:       true,
++					Executable:  shell.ShellCommand,
++					Args:        []string{shell.ShellArgument, script},
++				},
++				// Keeps the project up once the process under test has stopped.
++				"keepalive": {
++					Name:        "keepalive",
++					ReplicaName: "keepalive",
++					Executable:  shell.ShellCommand,
++					Args:        []string{shell.ShellArgument, getSleepCommand(60)},
++				},
++			},
++		},
++	})
++	if err != nil {
++		t.Fatal(err)
++	}
++	go func() { _ = runner.Run() }()
++	t.Cleanup(func() { _ = runner.ShutDownProject() })
++
++	logged := func() string {
++		logs, err := runner.GetProcessLog(name, 0, 0)
++		if err != nil {
++			t.Fatal(err)
++		}
++		return strings.Join(logs, "\n")
++	}
++	deadline := time.Now().Add(10 * time.Second)
++	for !strings.Contains(logged(), "ready") {
++		if time.Now().After(deadline) {
++			t.Fatalf("process never came up; log: %q", logged())
++		}
++		time.Sleep(20 * time.Millisecond)
++	}
++
++	if err := runner.StopProcess(name); err != nil {
++		t.Fatalf("stop: %v", err)
++	}
++	waitForProcessState(t, runner, name, types.ProcessStateCompleted, 10*time.Second)
++
++	got := logged()
++	for _, want := range []string{"got TERM", "cleaning up", "bye"} {
++		if !strings.Contains(got, want) {
++			t.Errorf("output written while shutting down is missing %q; log: %q", want, got)
++		}
++	}
++	if strings.Contains(got, "got HUP") {
++		t.Errorf("process was sent SIGHUP instead of the configured signal; log: %q", got)
++	}
++	state, err := runner.GetProcessState(name)
++	if err != nil {
++		t.Fatal(err)
++	}
++	if state.ExitCode != 0 {
++		t.Errorf("exit code = %d, want the process's own 0", state.ExitCode)
++	}
++}
++
++// A graceful shutdown waits for a process that ignores its stop signal and has
++// no shutdown timeout for as long as it likes to run. Forcing the shutdown must
++// end the project regardless, and leave nothing running behind it.
++func TestForceShutDownProject(t *testing.T) {
++	if runtime.GOOS == "windows" {
++		t.Skip("relies on Unix signals")
++	}
++	shell := command.DefaultShellConfig()
++	marker := filepath.Join(t.TempDir(), "beats")
++	runner, err := NewProjectRunner(&ProjectOpts{
++		project: &types.Project{
++			ShellConfig: shell,
++			Processes: map[string]types.ProcessConfig{
++				"stubborn": {
++					Name:        "stubborn",
++					ReplicaName: "stubborn",
++					Executable:  shell.ShellCommand,
++					Args: []string{shell.ShellArgument,
++						fmt.Sprintf("trap '' TERM; while :; do echo beat >> %q; sleep 0.05; done", marker)},
++				},
++				// Still waiting for a dependency that never completes.
++				"pending": {
++					Name:        "pending",
++					ReplicaName: "pending",
++					Executable:  shell.ShellCommand,
++					Args:        []string{shell.ShellArgument, "echo started >> " + marker + ".pending"},
++					DependsOn: types.DependsOnConfig{
++						"stubborn": {Condition: types.ProcessConditionCompleted},
++					},
++				},
++			},
++		},
++	})
++	if err != nil {
++		t.Fatal(err)
++	}
++	done := make(chan error, 1)
++	go func() { done <- runner.Run() }()
++	if !waitForLineCount(t, marker, 1, 10*time.Second) {
++		t.Fatal("process never started")
++	}
++	proc := runner.getRunningProcess("stubborn")
++	if proc == nil {
++		t.Fatal("process is not registered")
++	}
++	t.Cleanup(func() { _ = proc.command.Stop(int(syscall.SIGKILL), false) })
++
++	go func() { _ = runner.ShutDownProject() }()
++	select {
++	case err := <-done:
++		t.Fatalf("project exited (%v) although a process ignores its stop signal", err)
++	case <-time.After(time.Second):
++	}
++
++	runner.ForceShutDownProject(130)
++	select {
++	case err := <-done:
++		var exitErr *ExitError
++		if !errors.As(err, &exitErr) || exitErr.Code != 130 {
++			t.Errorf("project exited with %v, want exit code 130", err)
++		}
++	case <-time.After(10 * time.Second):
++		t.Fatal("project did not exit after a forced shutdown")
++	}
++
++	before := countLinesIn(t, marker)
++	time.Sleep(300 * time.Millisecond)
++	if after := countLinesIn(t, marker); after != before {
++		t.Error("the process is still running after a forced shutdown")
++	}
++	if countLinesIn(t, marker+".pending") != 0 {
++		t.Error("a process that was waiting for its dependency was launched by the forced shutdown")
++	}
++}
+diff --git a/src/cmd/output_closed_unix.go b/src/cmd/output_closed_unix.go
+new file mode 100644
+index 0000000..84d3380
+--- /dev/null
++++ b/src/cmd/output_closed_unix.go
+@@ -0,0 +1,68 @@
++//go:build !windows
++
++package cmd
++
++import (
++	"os"
++	"os/signal"
++	"syscall"
++
++	"github.com/rs/zerolog/log"
++	"golang.org/x/sys/unix"
++)
++
++// notifyOutputClosed calls report, once, when whatever reads the output of
++// process-compose has gone away - `process-compose up | head`, or a log
++// collector that died.
++//
++// Writing to a closed pipe raises SIGPIPE, and by default that kills a Go
++// program outright when the pipe is its standard output or error. Dying is the
++// right response; dying without stopping the processes first is not, and they
++// would be left running.
++//
++// Subscribing to SIGPIPE turns that death into a failed write, for every file
++// descriptor. So the signal alone says nothing: a client hanging up on the API
++// in the middle of a response raises it too. Only when standard output or
++// error itself turns out to be closed is it reported.
++func notifyOutputClosed(report func()) {
++	pipes := make(chan os.Signal, 1)
++	signal.Notify(pipes, syscall.SIGPIPE)
++	go func() {
++		reported := false
++		for range pipes {
++			if reported || !anyClosed(int(os.Stdout.Fd()), int(os.Stderr.Fd())) {
++				continue
++			}
++			// Keep draining afterwards: every further write to the closed
++			// output raises the signal again.
++			reported = true
++			log.Info().Msg("Output closed - Shutting down the running processes...")
++			report()
++		}
++	}()
++}
++
++// anyClosed reports whether the reading side of any of the given descriptors
++// has been closed.
++func anyClosed(fds ...int) bool {
++	polled := make([]unix.PollFd, len(fds))
++	for i, fd := range fds {
++		polled[i] = unix.PollFd{Fd: int32(fd), Events: unix.POLLOUT}
++	}
++	for {
++		_, err := unix.Poll(polled, 0)
++		if err == unix.EINTR {
++			continue
++		}
++		if err != nil {
++			return false
++		}
++		break
++	}
++	for _, fd := range polled {
++		if fd.Revents&(unix.POLLERR|unix.POLLHUP) != 0 {
++			return true
++		}
++	}
++	return false
++}
+diff --git a/src/cmd/output_closed_unix_test.go b/src/cmd/output_closed_unix_test.go
+new file mode 100644
+index 0000000..a545b60
+--- /dev/null
++++ b/src/cmd/output_closed_unix_test.go
+@@ -0,0 +1,34 @@
++//go:build !windows
++
++package cmd
++
++import (
++	"os"
++	"testing"
++)
++
++func TestAnyClosed(t *testing.T) {
++	reader, writer, err := os.Pipe()
++	if err != nil {
++		t.Fatal(err)
++	}
++	defer writer.Close()
++	devNull, err := os.OpenFile(os.DevNull, os.O_WRONLY, 0)
++	if err != nil {
++		t.Fatal(err)
++	}
++	defer devNull.Close()
++
++	if anyClosed(int(writer.Fd()), int(devNull.Fd())) {
++		t.Error("a pipe that is still being read was reported as closed")
++	}
++	if err := reader.Close(); err != nil {
++		t.Fatal(err)
++	}
++	if !anyClosed(int(devNull.Fd()), int(writer.Fd())) {
++		t.Error("a pipe whose reader is gone was not reported as closed")
++	}
++	if anyClosed(int(devNull.Fd())) {
++		t.Error("a file was reported as closed")
++	}
++}
+diff --git a/src/cmd/output_closed_windows.go b/src/cmd/output_closed_windows.go
+new file mode 100644
+index 0000000..cf71555
+--- /dev/null
++++ b/src/cmd/output_closed_windows.go
+@@ -0,0 +1,6 @@
++package cmd
++
++// notifyOutputClosed does nothing on Windows, which has no SIGPIPE: a write to
++// a closed pipe simply fails there.
++func notifyOutputClosed(_ func()) {
++}
+diff --git a/src/cmd/project_runner.go b/src/cmd/project_runner.go
+index 85a58c8..25d78a5 100644
+--- a/src/cmd/project_runner.go
++++ b/src/cmd/project_runner.go
+@@ -5,6 +5,7 @@ import (
+ 	"os"
+ 	"os/signal"
+ 	"syscall"
++	"time"
+ 
+ 	"github.com/f1bonacc1/process-compose/src/app"
+ 	"github.com/f1bonacc1/process-compose/src/config"
+@@ -65,21 +66,79 @@ func runProject(runner *app.ProjectRunner) error {
+ 	return err
+ }
+ 
+-func setSignal(signalHandler func()) {
+-	cancelChan := make(chan os.Signal, 1)
+-	signal.Notify(cancelChan, syscall.SIGTERM, os.Interrupt, syscall.SIGHUP)
+-	go func() {
+-		sig := <-cancelChan
+-		log.Info().Msgf("Caught %v - Shutting down the running processes...", sig)
+-		signalHandler()
+-	}()
++// shutdownSignals are the signals on which process-compose shuts its processes
++// down before exiting.
++//
++// SIGQUIT (Ctrl-\) is among them on purpose. Left alone, the Go runtime answers
++// it by dumping every goroutine and exiting on the spot - and the processes,
++// each in a process group of its own and so untouched by a signal from the
++// terminal, are left running with nobody to stop them.
++var shutdownSignals = []os.Signal{syscall.SIGTERM, os.Interrupt, syscall.SIGHUP, syscall.SIGQUIT}
++
++// forceSignalGap is how long after the first signal a further one is taken for
++// part of the same request rather than for a demand to hurry up. Supervisors
++// and closing terminals routinely deliver two signals at once (SIGTERM with
++// SIGHUP, say), and that must not turn a graceful shutdown into a kill.
++const forceSignalGap = time.Second
++
++func setSignal(shutDown func(), forceShutDown func(sig os.Signal)) {
++	cancelChan := make(chan os.Signal, 4)
++	signal.Notify(cancelChan, shutdownSignals...)
++	// Losing whoever reads our output ends the project the same way a signal
++	// does, and takes the same route.
++	notifyOutputClosed(func() {
++		select {
++		case cancelChan <- syscall.SIGPIPE:
++		default:
++		}
++	})
++	go handleSignals(cancelChan, shutDown, forceShutDown, forceSignalGap)
++}
++
++// handleSignals shuts the project down on the first signal, and forces the
++// matter on a later one.
++//
++// A graceful shutdown waits for every process to exit, and a process that
++// ignores its stop signal and has no shutdown timeout never does. Without a way
++// to insist, the only way out of that is to kill process-compose itself, which
++// leaves all of its processes behind.
++func handleSignals(signals <-chan os.Signal, shutDown func(), forceShutDown func(sig os.Signal), gap time.Duration) {
++	sig := <-signals
++	log.Info().Msgf("Caught %v - Shutting down the running processes...", sig)
++	started := time.Now()
++	go shutDown()
++	for sig = range signals {
++		if time.Since(started) < gap {
++			log.Debug().Msgf("Caught %v right after the shutdown began - ignoring", sig)
++			continue
++		}
++		log.Warn().Msgf("Caught %v during the shutdown - killing the running processes", sig)
++		forceShutDown(sig)
++		return
++	}
++}
++
++// signalExitCode is the exit code of a shutdown that had to be forced: the
++// shell's own convention for a program ended by that signal.
++func signalExitCode(sig os.Signal) int {
++	if number, ok := sig.(syscall.Signal); ok {
++		return 128 + int(number)
++	}
++	return 1
+ }
+ 
+ func runHeadless(project *app.ProjectRunner) error {
+ 	util.SetProjectNameAsTerminalTitle(project)
+-	setSignal(func() {
+-		_ = project.ShutDownProject()
+-	})
++	setSignal(
++		func() {
++			fmt.Fprintln(os.Stderr, "Shutting down the running processes... (signal again to kill them)")
++			_ = project.ShutDownProject()
++		},
++		func(sig os.Signal) {
++			fmt.Fprintln(os.Stderr, "Killing the running processes...")
++			project.ForceShutDownProject(signalExitCode(sig))
++		},
++	)
+ 	return project.Run()
+ }
+ 
+diff --git a/src/cmd/signal_test.go b/src/cmd/signal_test.go
+new file mode 100644
+index 0000000..6c64c91
+--- /dev/null
++++ b/src/cmd/signal_test.go
+@@ -0,0 +1,106 @@
++package cmd
++
++import (
++	"os"
++	"slices"
++	"syscall"
++	"testing"
++	"time"
++)
++
++// Every signal a terminal or a supervisor uses to end a program has to shut
++// the processes down first. SIGQUIT (Ctrl-\) is the one the Go runtime would
++// otherwise answer by itself - with a goroutine dump and an immediate exit that
++// leaves every process running.
++func TestShutdownSignals(t *testing.T) {
++	for _, sig := range []os.Signal{os.Interrupt, syscall.SIGTERM, syscall.SIGHUP, syscall.SIGQUIT} {
++		if !slices.Contains(shutdownSignals, sig) {
++			t.Errorf("%v does not shut the project down", sig)
++		}
++	}
++}
++
++func TestHandleSignals(t *testing.T) {
++	const gap = 200 * time.Millisecond
++	newHandler := func() (chan os.Signal, chan struct{}, chan os.Signal, chan struct{}) {
++		signals := make(chan os.Signal, 4)
++		shutDown := make(chan struct{}, 4)
++		forced := make(chan os.Signal, 4)
++		finished := make(chan struct{})
++		go func() {
++			defer close(finished)
++			handleSignals(signals,
++				func() { shutDown <- struct{}{} },
++				func(sig os.Signal) { forced <- sig },
++				gap)
++		}()
++		return signals, shutDown, forced, finished
++	}
++	expectShutDown := func(t *testing.T, shutDown chan struct{}) {
++		t.Helper()
++		select {
++		case <-shutDown:
++		case <-time.After(5 * time.Second):
++			t.Fatal("the first signal did not start a shutdown")
++		}
++	}
++
++	t.Run("first signal shuts down gracefully", func(t *testing.T) {
++		signals, shutDown, forced, _ := newHandler()
++		signals <- syscall.SIGQUIT
++		expectShutDown(t, shutDown)
++		select {
++		case sig := <-forced:
++			t.Errorf("a single %v forced the shutdown", sig)
++		case <-time.After(2 * gap):
++		}
++	})
++
++	t.Run("signals arriving together are one request", func(t *testing.T) {
++		signals, shutDown, forced, _ := newHandler()
++		// What a supervisor or a closing terminal sends.
++		signals <- syscall.SIGTERM
++		signals <- syscall.SIGHUP
++		expectShutDown(t, shutDown)
++		select {
++		case sig := <-forced:
++			t.Errorf("%v, delivered together with the first signal, forced the shutdown", sig)
++		case <-time.After(2 * gap):
++		}
++		select {
++		case <-shutDown:
++			t.Error("the shutdown was started twice")
++		default:
++		}
++	})
++
++	t.Run("a later signal forces the shutdown", func(t *testing.T) {
++		signals, shutDown, forced, finished := newHandler()
++		signals <- os.Interrupt
++		expectShutDown(t, shutDown)
++		time.Sleep(2 * gap)
++		signals <- syscall.SIGQUIT
++		select {
++		case sig := <-forced:
++			if sig != syscall.SIGQUIT {
++				t.Errorf("forced by %v, want %v", sig, syscall.SIGQUIT)
++			}
++		case <-time.After(5 * time.Second):
++			t.Fatal("a second signal did not force the shutdown")
++		}
++		select {
++		case <-finished:
++		case <-time.After(5 * time.Second):
++			t.Fatal("the handler kept running after forcing the shutdown")
++		}
++	})
++}
++
++func TestSignalExitCode(t *testing.T) {
++	if got := signalExitCode(syscall.SIGINT); got != 130 {
++		t.Errorf("exit code for SIGINT = %d, want 130", got)
++	}
++	if got := signalExitCode(syscall.SIGQUIT); got != 131 {
++		t.Errorf("exit code for SIGQUIT = %d, want 131", got)
++	}
++}
+diff --git a/src/command/command.go b/src/command/command.go
+index c6e7f38..54327b0 100644
+--- a/src/command/command.go
++++ b/src/command/command.go
+@@ -14,9 +14,13 @@ func BuildCommand(cmd string, args []string) *CmdWrapper {
+ 	}
+ }
+ 
+-func BuildPtyCommand(cmd string, args []string) *CmdWrapperPty {
++// BuildPtyCommand builds a command that runs on a pseudo terminal. interactive
++// says whether the terminal is a session somebody types into, as opposed to one
++// that only exists so that the command believes it is writing to a terminal.
++func BuildPtyCommand(cmd string, args []string, interactive bool) *CmdWrapperPty {
+ 	return &CmdWrapperPty{
+-		CmdWrapper: BuildCommand(cmd, args),
++		CmdWrapper:  BuildCommand(cmd, args),
++		interactive: interactive,
+ 	}
+ }
+ 
+diff --git a/src/command/command_wrapper.go b/src/command/command_wrapper.go
+index 7f6d611..7c936a7 100644
+--- a/src/command/command_wrapper.go
++++ b/src/command/command_wrapper.go
+@@ -1,13 +1,29 @@
+ package command
+ 
+ import (
++	"context"
++	"errors"
+ 	"io"
+ 	"os"
+ 	"os/exec"
++	"sync"
++	"sync/atomic"
+ )
+ 
+ type CmdWrapper struct {
+ 	cmd *exec.Cmd
++	// childPipes are the write ends of the output pipes handed to the child.
++	// The parent must drop its copies once the child holds its own, or the
++	// readers would never see EOF.
++	childPipes []*os.File
++	// groupGone is set once the child's process group is known to be empty.
++	// Its ID can be recycled from then on, so nothing may be signalled through
++	// it any more.
++	groupGone atomic.Bool
++	// treePids are the descendants signalled individually on behalf of a
++	// command that has no process group of its own. Guarded by treeMtx.
++	treePids []int
++	treeMtx  sync.Mutex
+ }
+ 
+ func (c *CmdWrapper) GetPty() *os.File {
+@@ -15,19 +31,25 @@ func (c *CmdWrapper) GetPty() *os.File {
+ }
+ 
+ func (c *CmdWrapper) Start() error {
+-	return c.cmd.Start()
++	err := c.cmd.Start()
++	c.closeChildPipes()
++	return err
+ }
+ 
+ func (c *CmdWrapper) Run() error {
+ 	return c.cmd.Run()
+ }
+ 
++// Wait blocks until the command itself has exited. It deliberately does not
++// wait for - or close - the pipes returned by StdoutPipe and StderrPipe: a
++// descendant that inherited them can keep them open long after the command is
++// gone, and the exit must still be noticed. Draining them is up to the caller.
+ func (c *CmdWrapper) Wait() error {
+ 	return c.cmd.Wait()
+ }
+ 
+ func (c *CmdWrapper) ExitCode() int {
+-	return c.cmd.ProcessState.ExitCode()
++	return exitCode(c.cmd.ProcessState)
+ }
+ 
+ func (c *CmdWrapper) Pid() int {
+@@ -35,11 +57,54 @@ func (c *CmdWrapper) Pid() int {
+ }
+ 
+ func (c *CmdWrapper) StdoutPipe() (io.ReadCloser, error) {
+-	return c.cmd.StdoutPipe()
++	if c.cmd.Stdout != nil {
++		return nil, errors.New("command: stdout already set")
++	}
++	reader, writer, err := c.outputPipe()
++	if err != nil {
++		return nil, err
++	}
++	c.cmd.Stdout = writer
++	return reader, nil
+ }
+ 
+ func (c *CmdWrapper) StderrPipe() (io.ReadCloser, error) {
+-	return c.cmd.StderrPipe()
++	if c.cmd.Stderr != nil {
++		return nil, errors.New("command: stderr already set")
++	}
++	reader, writer, err := c.outputPipe()
++	if err != nil {
++		return nil, err
++	}
++	c.cmd.Stderr = writer
++	return reader, nil
++}
++
++// outputPipe creates a pipe whose write end goes to the child.
++//
++// exec.Cmd's own StdoutPipe is not used because Cmd.Wait closes its read end
++// the moment the command exits, which forces callers to finish reading before
++// they call Wait - and a read only finishes when every holder of the write end
++// is gone. A command that leaves a background child behind would then never be
++// seen to exit. With a pipe we own, Wait reports the exit right away and the
++// read end stays valid for as long as there is something left to read.
++func (c *CmdWrapper) outputPipe() (*os.File, *os.File, error) {
++	reader, writer, err := os.Pipe()
++	if err != nil {
++		// The command will not be started now. Let go of the pipes created so
++		// far, so that whoever is already reading from one sees it end.
++		c.closeChildPipes()
++		return nil, nil, err
++	}
++	c.childPipes = append(c.childPipes, writer)
++	return reader, writer, nil
++}
++
++func (c *CmdWrapper) closeChildPipes() {
++	for _, pipe := range c.childPipes {
++		_ = pipe.Close()
++	}
++	c.childPipes = nil
+ }
+ 
+ func (c *CmdWrapper) StdinPipe() (io.WriteCloser, error) {
+@@ -67,3 +132,21 @@ func (c *CmdWrapper) Output() ([]byte, error) {
+ func (c *CmdWrapper) CombinedOutput() ([]byte, error) {
+ 	return c.cmd.CombinedOutput()
+ }
++
++// WaitGroupExit blocks until no live process is left in the command's process
++// group, or until ctx is done. It reports whether the group is gone.
++//
++// Stopping a command signals its whole group, but the command exiting says
++// nothing about the rest of it: a shell wrapper dies on SIGTERM at once while
++// the server it launched is still closing its listeners. Only when the group is
++// empty have the resources it held - ports above all - actually been released.
++func (c *CmdWrapper) WaitGroupExit(ctx context.Context) bool {
++	if c.groupGone.Load() {
++		return true
++	}
++	gone := c.waitGroupExit(ctx)
++	if gone {
++		c.groupGone.Store(true)
++	}
++	return gone
++}
+diff --git a/src/command/command_wrapper_pty.go b/src/command/command_wrapper_pty.go
+index d12a85f..a585082 100644
+--- a/src/command/command_wrapper_pty.go
++++ b/src/command/command_wrapper_pty.go
+@@ -13,6 +13,8 @@ import (
+ type CmdWrapperPty struct {
+ 	*CmdWrapper
+ 	ptmx *os.File
++	// interactive marks a terminal session, which is stopped by hanging up.
++	interactive bool
+ }
+ 
+ func (c *CmdWrapperPty) GetPty() *os.File {
+@@ -43,14 +45,27 @@ func (c *CmdWrapperPty) Start() (err error) {
+ 	return err
+ }
+ 
++// Wait blocks until the command has exited. The PTY is left open so that
++// output still buffered in it can be read; the caller closes it once drained.
+ func (c *CmdWrapperPty) Wait() error {
+-	defer c.ptmx.Close()
+ 	return c.cmd.Wait()
+ }
+ 
+ func (c *CmdWrapperPty) Stop(sig int, parentOnly bool) error {
+-	// For PTY processes (interactive), SIGTERM is often ignored (e.g. shells).
+-	// They expect SIGHUP (hangup) to terminate gracefully.
++	if !c.interactive {
++		// The terminal is only there so that the command sees one - for
++		// colour, mostly. It is stopped like any other command: with the signal
++		// that was asked for, and with its terminal left open. Closing the
++		// terminal here would fail every write the command makes while it shuts
++		// down, losing that output and, for runtimes that report a failed flush
++		// at exit, replacing its exit code. The terminal is closed once the
++		// command has exited and its output has been read.
++		return c.CmdWrapper.Stop(sig, parentOnly)
++	}
++
++	// An interactive session is ended by hanging up: SIGTERM is often ignored
++	// there (shells do), SIGHUP is what they expect, and closing the terminal
++	// delivers the hangup to whatever is in its foreground.
+ 	if sig == int(syscall.SIGTERM) {
+ 		sig = int(syscall.SIGHUP)
+ 	}
+diff --git a/src/command/command_wrapper_pty_unix_test.go b/src/command/command_wrapper_pty_unix_test.go
+new file mode 100644
+index 0000000..b14c9d4
+--- /dev/null
++++ b/src/command/command_wrapper_pty_unix_test.go
+@@ -0,0 +1,96 @@
++//go:build !windows
++
++package command
++
++import (
++	"bufio"
++	"strings"
++	"syscall"
++	"testing"
++	"time"
++)
++
++// ptyScript reports which signal stopped it and takes a moment to shut down,
++// writing as it goes - the way a server logs its own shutdown.
++const ptyScript = `trap 'echo got TERM; sleep 0.2; echo cleaning up; sleep 0.2; echo bye; exit 0' TERM
++trap 'echo got HUP; exit 7' HUP
++echo ready
++while :; do sleep 0.05; done`
++
++// readPtyLines reads the terminal until it ends and returns what was written.
++func readPtyLines(t *testing.T, reader *bufio.Reader) string {
++	t.Helper()
++	var out strings.Builder
++	for {
++		line, err := reader.ReadString('\n')
++		out.WriteString(line)
++		if err != nil {
++			return out.String()
++		}
++	}
++}
++
++func startPtyScript(t *testing.T, interactive bool) (*CmdWrapperPty, *bufio.Reader) {
++	t.Helper()
++	cmd := BuildPtyCommand("bash", []string{"-c", ptyScript}, interactive)
++	stdout, err := cmd.StdoutPipe()
++	if err != nil {
++		t.Fatal(err)
++	}
++	t.Cleanup(func() { _ = syscall.Kill(-cmd.Pid(), syscall.SIGKILL) })
++	reader := bufio.NewReader(stdout)
++	line, err := reader.ReadString('\n')
++	if err != nil || !strings.Contains(line, "ready") {
++		t.Fatalf("command did not come up: %q, %v", line, err)
++	}
++	return cmd, reader
++}
++
++// A command that runs on a terminal only to get one - `is_tty`, for coloured
++// output - is stopped like any other: with the signal that was asked for, and
++// with its terminal left open, so that it can still write while it shuts down
++// and exits with its own status.
++func TestPtyStopKeepsTerminalOpen(t *testing.T) {
++	cmd, reader := startPtyScript(t, false)
++
++	if err := cmd.Stop(int(syscall.SIGTERM), false); err != nil {
++		t.Fatalf("stop: %v", err)
++	}
++	output := make(chan string, 1)
++	go func() { output <- readPtyLines(t, reader) }()
++	_ = cmd.Wait()
++
++	var got string
++	select {
++	case got = <-output:
++	case <-time.After(10 * time.Second):
++		t.Fatal("terminal output did not end after the command exited")
++	}
++	for _, want := range []string{"got TERM", "cleaning up", "bye"} {
++		if !strings.Contains(got, want) {
++			t.Errorf("output written while shutting down is missing %q; got %q", want, got)
++		}
++	}
++	if strings.Contains(got, "got HUP") {
++		t.Errorf("command was sent SIGHUP instead of the requested signal; got %q", got)
++	}
++	if code := cmd.ExitCode(); code != 0 {
++		t.Errorf("exit code = %d, want the command's own 0", code)
++	}
++}
++
++// An interactive session is still ended by hanging up.
++func TestPtyStopHangsUpInteractiveSession(t *testing.T) {
++	cmd, _ := startPtyScript(t, true)
++
++	if err := cmd.Stop(int(syscall.SIGTERM), false); err != nil {
++		t.Fatalf("stop: %v", err)
++	}
++	if _, err := cmd.GetPty().Write([]byte("x")); err == nil {
++		t.Error("terminal is still open after the session was stopped")
++	}
++	_ = cmd.Wait()
++	if code := cmd.ExitCode(); code != 7 {
++		t.Errorf("exit code = %d, want 7: the session should have received SIGHUP", code)
++	}
++}
+diff --git a/src/command/command_wrapper_unix_test.go b/src/command/command_wrapper_unix_test.go
+new file mode 100644
+index 0000000..98b3f19
+--- /dev/null
++++ b/src/command/command_wrapper_unix_test.go
+@@ -0,0 +1,222 @@
++//go:build !windows
++
++package command
++
++import (
++	"bufio"
++	"context"
++	"errors"
++	"os"
++	"os/exec"
++	"strings"
++	"syscall"
++	"testing"
++	"time"
++)
++
++// Wait must report the command's exit even while a child it left behind keeps
++// the output pipe open, and the pipe must stay readable afterwards.
++func TestWaitDoesNotDependOnOutputPipe(t *testing.T) {
++	cmd := BuildCommand("bash", []string{"-c", "echo first; (sleep 0.5; echo late) & exit 4"})
++	cmd.SetCmdArgs()
++	stdout, err := cmd.StdoutPipe()
++	if err != nil {
++		t.Fatal(err)
++	}
++	if err := cmd.Start(); err != nil {
++		t.Fatal(err)
++	}
++	t.Cleanup(func() { _ = cmd.Stop(int(syscall.SIGKILL), false) })
++
++	waited := make(chan struct{})
++	go func() {
++		_ = cmd.Wait()
++		close(waited)
++	}()
++	select {
++	case <-waited:
++	case <-time.After(5 * time.Second):
++		t.Fatal("Wait is blocked on the output pipe of a command that has exited")
++	}
++	if got := cmd.ExitCode(); got != 4 {
++		t.Errorf("exit code = %d, want 4", got)
++	}
++
++	// Everything is still delivered, including what arrives after the exit.
++	reader := bufio.NewReader(stdout)
++	for _, want := range []string{"first", "late"} {
++		line, err := reader.ReadString('\n')
++		if err != nil {
++			t.Fatalf("reading %q: %v", want, err)
++		}
++		if got := strings.TrimSpace(line); got != want {
++			t.Errorf("read %q, want %q", got, want)
++		}
++	}
++}
++
++func TestExitCodeOfSignalledCommand(t *testing.T) {
++	tests := []struct {
++		name string
++		args []string
++		want int
++	}{
++		{"SIGKILL", []string{"-c", "kill -KILL $$"}, 128 + int(syscall.SIGKILL)},
++		{"SIGTERM", []string{"-c", "kill -TERM $$"}, 128 + int(syscall.SIGTERM)},
++		{"exit status", []string{"-c", "exit 42"}, 42},
++		{"success", []string{"-c", "exit 0"}, 0},
++	}
++	for _, tt := range tests {
++		t.Run(tt.name, func(t *testing.T) {
++			cmd := BuildCommand("bash", tt.args)
++			_ = cmd.Run()
++			if got := cmd.ExitCode(); got != tt.want {
++				t.Errorf("exit code = %d, want %d", got, tt.want)
++			}
++		})
++	}
++
++	t.Run("never started", func(t *testing.T) {
++		if got := BuildCommand("bash", nil).ExitCode(); got != -1 {
++			t.Errorf("exit code = %d, want -1", got)
++		}
++	})
++}
++
++// The group outlives its leader: a wrapper shell is killed outright while the
++// process it started takes its time. WaitGroupExit must see that through, and
++// the group must stay reachable by signal once the leader has been reaped.
++func TestWaitGroupExit(t *testing.T) {
++	// The child shrugs off SIGTERM; the wrapper in front of it does not.
++	cmd := BuildCommand("bash", []string{"-c", "bash -c 'trap \"\" TERM; while :; do sleep 0.05; done' & wait"})
++	cmd.SetCmdArgs()
++	if err := cmd.Start(); err != nil {
++		t.Fatal(err)
++	}
++	t.Cleanup(func() { _ = syscall.Kill(-cmd.Pid(), syscall.SIGKILL) })
++	// Let the child install its trap.
++	time.Sleep(300 * time.Millisecond)
++
++	if err := cmd.Stop(int(syscall.SIGTERM), false); err != nil {
++		t.Fatalf("stop: %v", err)
++	}
++	_ = cmd.Wait()
++
++	ctx, cancel := context.WithTimeout(context.Background(), 300*time.Millisecond)
++	gone := cmd.WaitGroupExit(ctx)
++	cancel()
++	if gone {
++		t.Fatal("group reported gone while a member is still running")
++	}
++
++	// The leader is reaped by now; the rest of the group must still be killable.
++	if err := cmd.Stop(int(syscall.SIGKILL), false); err != nil {
++		t.Fatalf("kill after the leader was reaped: %v", err)
++	}
++	ctx, cancel = context.WithTimeout(context.Background(), 5*time.Second)
++	defer cancel()
++	if !cmd.WaitGroupExit(ctx) {
++		t.Fatal("group still reported alive after SIGKILL")
++	}
++	// Its ID may be reused from here on, so nothing more is sent to it.
++	if err := cmd.Stop(int(syscall.SIGKILL), false); err != syscall.ESRCH {
++		t.Errorf("stop after the group was gone = %v, want %v", err, syscall.ESRCH)
++	}
++}
++
++// A command that shares our own process group has no group of its own.
++func TestWaitGroupExitWithoutOwnGroup(t *testing.T) {
++	cmd := &CmdWrapper{cmd: exec.Command("bash", "-c", "exit 0")}
++	if err := cmd.Start(); err != nil {
++		t.Fatal(err)
++	}
++	_ = cmd.Wait()
++	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
++	defer cancel()
++	if !cmd.WaitGroupExit(ctx) {
++		t.Error("waited for a group the command does not own")
++	}
++}
++
++const sharedGroupHelperEnv = "PC_TEST_SHARED_GROUP_HELPER"
++
++// A command that shares our process group - the foreground process of
++// `process-compose run` - must be stopped together with its children, and
++// without the signal reaching the rest of the group: that is ourselves and
++// whoever launched us.
++//
++// The stop is performed by a re-executed copy of the test binary in a group of
++// its own, so that a signal sent to the group kills that copy, where it can be
++// observed, instead of the test run.
++func TestStopOfCommandSharingOurGroup(t *testing.T) {
++	if os.Getenv(sharedGroupHelperEnv) != "" {
++		stopCommandSharingOurGroup()
++		return
++	}
++	helper := exec.Command(os.Args[0], "-test.run=^TestStopOfCommandSharingOurGroup$")
++	helper.Env = append(os.Environ(), sharedGroupHelperEnv+"=1")
++	helper.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
++	if err := helper.Start(); err != nil {
++		t.Fatal(err)
++	}
++	pgid := helper.Process.Pid
++	t.Cleanup(func() { _ = syscall.Kill(-pgid, syscall.SIGKILL) })
++
++	// The outcome is read from the process state below; Wait's error only
++	// restates a non-zero exit.
++	done := make(chan struct{})
++	go func() {
++		defer close(done)
++		_ = helper.Wait()
++	}()
++	select {
++	case <-done:
++	case <-time.After(30 * time.Second):
++		t.Fatal("helper did not finish")
++	}
++	status, ok := helper.ProcessState.Sys().(syscall.WaitStatus)
++	if !ok {
++		t.Fatalf("unexpected process state %v", helper.ProcessState)
++	}
++	if status.Signaled() {
++		t.Fatalf("the stop signalled our own process group: helper killed by %v", status.Signal())
++	}
++	if code := status.ExitStatus(); code != 0 {
++		t.Fatalf("helper failed with exit code %d (see stopCommandSharingOurGroup)", code)
++	}
++	// The command's child lived in the helper's group. It must be gone too.
++	deadline := time.Now().Add(5 * time.Second)
++	for isGroupAlive(pgid) {
++		if time.Now().After(deadline) {
++			t.Fatal("a child of the stopped command is still running")
++		}
++		time.Sleep(20 * time.Millisecond)
++	}
++}
++
++func stopCommandSharingOurGroup() {
++	// No SetCmdArgs: the command stays in our process group. The child would
++	// survive its shell if it were not signalled as well.
++	cmd := BuildCommand("bash", []string{"-c", "sleep 60 & wait"})
++	if err := cmd.Start(); err != nil {
++		os.Exit(10)
++	}
++	time.Sleep(300 * time.Millisecond)
++	if err := cmd.Stop(int(syscall.SIGTERM), false); err != nil {
++		os.Exit(11)
++	}
++	_ = cmd.Wait()
++	if code := cmd.ExitCode(); code != 128+int(syscall.SIGTERM) {
++		os.Exit(12)
++	}
++	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
++	defer cancel()
++	if !cmd.WaitGroupExit(ctx) {
++		os.Exit(13)
++	}
++	// Everything is gone, so there is nothing left to signal.
++	if err := cmd.Stop(int(syscall.SIGKILL), false); !errors.Is(err, syscall.ESRCH) {
++		os.Exit(14)
++	}
++	os.Exit(0)
++}
+diff --git a/src/command/commander.go b/src/command/commander.go
+index a9b881a..ef17ed3 100644
+--- a/src/command/commander.go
++++ b/src/command/commander.go
+@@ -1,6 +1,7 @@
+ package command
+ 
+ import (
++	"context"
+ 	"io"
+ 	"os"
+ )
+@@ -10,7 +11,12 @@ type Commander interface {
+ 	SetCmdArgs()
+ 	Start() error
+ 	Run() error
++	// Wait blocks until the command itself has exited. Output pipes are not
++	// drained or closed; see WaitGroupExit for the rest of its process group.
+ 	Wait() error
++	// WaitGroupExit blocks until the command's process group is empty or ctx
++	// is done, and reports whether it is empty.
++	WaitGroupExit(ctx context.Context) bool
+ 	ExitCode() int
+ 	Pid() int
+ 	StdoutPipe() (io.ReadCloser, error)
+diff --git a/src/command/group_linux.go b/src/command/group_linux.go
+new file mode 100644
+index 0000000..a0b9730
+--- /dev/null
++++ b/src/command/group_linux.go
+@@ -0,0 +1,128 @@
++package command
++
++import (
++	"bytes"
++	"os"
++	"strconv"
++)
++
++// procEntry is what /proc/<pid>/stat says about one process.
++type procEntry struct {
++	pid   int
++	ppid  int
++	pgrp  int
++	state byte
++}
++
++// isLive reports whether the process is still running, as opposed to having
++// exited without being reaped yet.
++func (e procEntry) isLive() bool {
++	return e.state != 'Z' && e.state != 'X'
++}
++
++// readProcs lists the processes visible in /proc. ok is false when /proc
++// yielded nothing usable, which proves nothing about what is running.
++func readProcs() (procs []procEntry, ok bool) {
++	entries, err := os.ReadDir("/proc")
++	if err != nil {
++		return nil, false
++	}
++	for _, entry := range entries {
++		pid, err := strconv.Atoi(entry.Name())
++		if err != nil {
++			continue
++		}
++		if proc, ok := readProc(pid); ok {
++			procs = append(procs, proc)
++		}
++	}
++	return procs, len(procs) > 0
++}
++
++func readProc(pid int) (procEntry, bool) {
++	stat, err := os.ReadFile("/proc/" + strconv.Itoa(pid) + "/stat")
++	if err != nil {
++		return procEntry{}, false
++	}
++	proc, ok := parseProcStat(stat)
++	proc.pid = pid
++	return proc, ok
++}
++
++// hasLiveGroupMember reports whether any process in the group is still running,
++// as opposed to having exited without being reaped yet. It is only consulted
++// once the kernel has confirmed that the group has members at all.
++func hasLiveGroupMember(pgid int) bool {
++	procs, ok := readProcs()
++	if !ok {
++		// Without /proc there is no telling the two apart; believe the kernel.
++		return true
++	}
++	for _, proc := range procs {
++		if proc.pgrp == pgid && proc.isLive() {
++			return true
++		}
++	}
++	return false
++}
++
++// isZombie reports whether pid has exited and is only waiting to be reaped.
++func isZombie(pid int) bool {
++	proc, ok := readProc(pid)
++	return ok && !proc.isLive()
++}
++
++// liveDescendants returns the running processes descended from root, nearest
++// first. root itself is not included.
++func liveDescendants(root int) []int {
++	procs, ok := readProcs()
++	if !ok {
++		return nil
++	}
++	children := make(map[int][]procEntry, len(procs))
++	for _, proc := range procs {
++		children[proc.ppid] = append(children[proc.ppid], proc)
++	}
++	var found []int
++	queue := []int{root}
++	seen := map[int]bool{root: true}
++	for len(queue) > 0 {
++		parent := queue[0]
++		queue = queue[1:]
++		for _, child := range children[parent] {
++			if seen[child.pid] {
++				continue
++			}
++			seen[child.pid] = true
++			queue = append(queue, child.pid)
++			if child.isLive() {
++				found = append(found, child.pid)
++			}
++		}
++	}
++	return found
++}
++
++// parseProcStat extracts the state, parent and process group from the contents
++// of /proc/<pid>/stat: "pid (comm) state ppid pgrp ...". The command name may
++// hold spaces and parentheses of its own, so the fields are located after the
++// last closing parenthesis.
++func parseProcStat(stat []byte) (procEntry, bool) {
++	end := bytes.LastIndexByte(stat, ')')
++	if end < 0 {
++		return procEntry{}, false
++	}
++	fields := bytes.Fields(stat[end+1:])
++	if len(fields) < 3 || len(fields[0]) != 1 {
++		return procEntry{}, false
++	}
++	ppid, err := strconv.Atoi(string(fields[1]))
++	if err != nil {
++		return procEntry{}, false
++	}
++	pgrp, err := strconv.Atoi(string(fields[2]))
++	if err != nil {
++		return procEntry{}, false
++	}
++	return procEntry{ppid: ppid, pgrp: pgrp, state: fields[0][0]}, true
++}
+diff --git a/src/command/group_linux_test.go b/src/command/group_linux_test.go
+new file mode 100644
+index 0000000..232f619
+--- /dev/null
++++ b/src/command/group_linux_test.go
+@@ -0,0 +1,61 @@
++package command
++
++import (
++	"syscall"
++	"testing"
++)
++
++func TestParseProcStat(t *testing.T) {
++	tests := []struct {
++		name      string
++		stat      string
++		wantState byte
++		wantPpid  int
++		wantPgrp  int
++		wantOk    bool
++	}{
++		{
++			name:      "running",
++			stat:      "4242 (python3) S 4241 4200 4200 0 -1 4194304 1 0",
++			wantState: 'S', wantPpid: 4241, wantPgrp: 4200, wantOk: true,
++		},
++		{
++			name:      "zombie",
++			stat:      "15 (python3) Z 1 14 14 0 -1 4228100 0 0",
++			wantState: 'Z', wantPpid: 1, wantPgrp: 14, wantOk: true,
++		},
++		{
++			// The command name is whatever the process says it is.
++			name:      "name with spaces and parentheses",
++			stat:      "77 (tmux: server (1) R) R 1 77 77 0 -1 0 0 0",
++			wantState: 'R', wantPpid: 1, wantPgrp: 77, wantOk: true,
++		},
++		{name: "truncated", stat: "77 (bash) S 1", wantOk: false},
++		{name: "garbage", stat: "not a stat line", wantOk: false},
++		{name: "empty", stat: "", wantOk: false},
++	}
++	for _, tt := range tests {
++		t.Run(tt.name, func(t *testing.T) {
++			proc, ok := parseProcStat([]byte(tt.stat))
++			if ok != tt.wantOk {
++				t.Fatalf("ok = %v, want %v", ok, tt.wantOk)
++			}
++			if !ok {
++				return
++			}
++			if proc.state != tt.wantState || proc.pgrp != tt.wantPgrp || proc.ppid != tt.wantPpid {
++				t.Errorf("got state %q ppid %d pgrp %d, want state %q ppid %d pgrp %d",
++					proc.state, proc.ppid, proc.pgrp, tt.wantState, tt.wantPpid, tt.wantPgrp)
++			}
++			if live := proc.isLive(); live != (tt.wantState != 'Z') {
++				t.Errorf("isLive = %v for state %q", live, proc.state)
++			}
++		})
++	}
++}
++
++func TestHasLiveGroupMember(t *testing.T) {
++	if !hasLiveGroupMember(syscall.Getpgrp()) {
++		t.Error("our own process group has no live member")
++	}
++}
+diff --git a/src/command/group_other.go b/src/command/group_other.go
+new file mode 100644
+index 0000000..fada6a1
+--- /dev/null
++++ b/src/command/group_other.go
+@@ -0,0 +1,66 @@
++//go:build !windows && !linux
++
++package command
++
++import (
++	puproc "github.com/shirou/gopsutil/v4/process"
++)
++
++// hasLiveGroupMember has no portable way to tell a running member from an
++// unreaped one, so the kernel's word that the group has members is taken as is.
++// Lingering unreaped orphans are a property of Linux containers without an init
++// process; elsewhere the system's init reaps them promptly.
++func hasLiveGroupMember(_ int) bool {
++	return true
++}
++
++// isZombie reports whether pid has exited and is only waiting to be reaped.
++func isZombie(pid int) bool {
++	proc, err := puproc.NewProcess(int32(pid))
++	if err != nil {
++		return false
++	}
++	statuses, err := proc.Status()
++	if err != nil {
++		return false
++	}
++	for _, status := range statuses {
++		if status == puproc.Zombie {
++			return true
++		}
++	}
++	return false
++}
++
++// liveDescendants returns the processes descended from root, nearest first.
++// root itself is not included.
++func liveDescendants(root int) []int {
++	procs, err := puproc.Processes()
++	if err != nil {
++		return nil
++	}
++	children := make(map[int][]int, len(procs))
++	for _, proc := range procs {
++		ppid, err := proc.Ppid()
++		if err != nil {
++			continue
++		}
++		children[int(ppid)] = append(children[int(ppid)], int(proc.Pid))
++	}
++	var found []int
++	queue := []int{root}
++	seen := map[int]bool{root: true}
++	for len(queue) > 0 {
++		parent := queue[0]
++		queue = queue[1:]
++		for _, child := range children[parent] {
++			if seen[child] {
++				continue
++			}
++			seen[child] = true
++			queue = append(queue, child)
++			found = append(found, child)
++		}
++	}
++	return found
++}
+diff --git a/src/command/stopper_unix.go b/src/command/stopper_unix.go
+index 31f23ba..d272915 100644
+--- a/src/command/stopper_unix.go
++++ b/src/command/stopper_unix.go
+@@ -3,17 +3,31 @@
+ package command
+ 
+ import (
+-	"github.com/rs/zerolog/log"
++	"context"
++	"errors"
++	"os"
++	"slices"
+ 	"syscall"
++	"time"
++
++	"github.com/rs/zerolog/log"
+ )
+ 
+ const (
+ 	min_sig = 1
+ 	max_sig = 31
++
++	// exitCodeSignalBase is added to the signal number to form the exit code
++	// of a command that was terminated by a signal - the convention every
++	// shell follows (143 for SIGTERM, 137 for SIGKILL).
++	exitCodeSignalBase = 128
++
++	groupPollMin = 5 * time.Millisecond
++	groupPollMax = 100 * time.Millisecond
+ )
+ 
+ func (c *CmdWrapper) Stop(sig int, parentOnly bool) error {
+-	if c.cmd == nil {
++	if c.cmd == nil || c.cmd.Process == nil {
+ 		return nil
+ 	}
+ 	if sig < min_sig || sig > max_sig {
+@@ -28,17 +42,166 @@ func (c *CmdWrapper) Stop(sig int, parentOnly bool) error {
+ 		Msg("Stop Unix process.")
+ 
+ 	if parentOnly {
+-		return c.cmd.Process.Signal(syscall.Signal(sig))
++		err := c.cmd.Process.Signal(syscall.Signal(sig))
++		if errors.Is(err, os.ErrProcessDone) {
++			return syscall.ESRCH
++		}
++		return err
++	}
++
++	if c.ownsGroup() {
++		// The command leads its own group, so the group ID is its PID. Going
++		// through Getpgid instead would fail as soon as the command itself has
++		// been reaped, leaving the rest of the group unreachable - exactly when
++		// a SIGKILL is needed for whatever outlived it.
++		if c.groupGone.Load() {
++			return syscall.ESRCH
++		}
++		return syscall.Kill(-c.Pid(), syscall.Signal(sig))
+ 	}
+ 
++	// The command has no group of its own. Usually it shares ours: the
++	// foreground process of `process-compose run` is left in our group so that
++	// it keeps the terminal. Signalling "its group" would then signal
++	// process-compose itself and whatever launched it - the shell script that
++	// is waiting for our exit code would be terminated instead of receiving it.
++	// The command and its descendants are signalled one by one instead.
+ 	pgid, err := syscall.Getpgid(c.Pid())
+-	if err == nil {
++	if err == nil && pgid != syscall.Getpgrp() {
++		// It moved itself into a group of its own, as an interactive shell
++		// with job control does.
+ 		return syscall.Kill(-pgid, syscall.Signal(sig))
+ 	}
++	// Once the command has been reaped its PID says nothing about it any more,
++	// so its descendants are looked up only while it is still there.
++	return c.signalTree(syscall.Signal(sig), err == nil)
++}
++
++// signalTree signals the command and those of its descendants that share our
++// process group, without touching anything else in that group.
++//
++// The descendants are remembered. Once the command has exited they are
++// reparented and can no longer be found by walking down from it, yet they are
++// what a later SIGKILL is meant for, and what WaitGroupExit has to wait on.
++func (c *CmdWrapper) signalTree(sig syscall.Signal, lookUp bool) error {
++	own := syscall.Getpgrp()
++	c.treeMtx.Lock()
++	if lookUp {
++		for _, pid := range liveDescendants(c.Pid()) {
++			if !slices.Contains(c.treePids, pid) {
++				c.treePids = append(c.treePids, pid)
++			}
++		}
++	}
++	targets := make([]int, 0, len(c.treePids))
++	for _, pid := range c.treePids {
++		// A process that left our group has detached itself from the command,
++		// and a PID that is no longer in it at all may have been recycled.
++		if pgid, err := syscall.Getpgid(pid); err == nil && pgid == own && isPidRunning(pid) {
++			targets = append(targets, pid)
++		}
++	}
++	c.treePids = targets
++	c.treeMtx.Unlock()
++
++	signalled := false
++	err := c.cmd.Process.Signal(sig)
++	switch {
++	case err == nil:
++		signalled = true
++	case !errors.Is(err, os.ErrProcessDone):
++		return err
++	}
++	for _, pid := range targets {
++		if syscall.Kill(pid, sig) == nil {
++			signalled = true
++		}
++	}
++	if !signalled {
++		return syscall.ESRCH
++	}
++	return nil
++}
++
++// isPidRunning reports whether pid is a running process, as opposed to one that
++// is gone or has exited without being reaped yet.
++func isPidRunning(pid int) bool {
++	if errors.Is(syscall.Kill(pid, 0), syscall.ESRCH) {
++		return false
++	}
++	return !isZombie(pid)
++}
+ 
+-	return err
++// hasRunningTree reports whether any of the descendants signalled by signalTree
++// is still running.
++func (c *CmdWrapper) hasRunningTree() bool {
++	c.treeMtx.Lock()
++	defer c.treeMtx.Unlock()
++	return slices.ContainsFunc(c.treePids, isPidRunning)
+ }
+ 
+ func (c *CmdWrapper) SetCmdArgs() {
+ 	c.cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+ }
++
++// ownsGroup reports whether the command was started as the leader of its own
++// process group, either directly (Setpgid) or as a session leader (Setsid, the
++// PTY case). A command sharing process-compose's own group has no group of its
++// own to wait for or to signal by ID.
++func (c *CmdWrapper) ownsGroup() bool {
++	attr := c.cmd.SysProcAttr
++	return attr != nil && c.cmd.Process != nil &&
++		((attr.Setpgid && attr.Pgid == 0) || attr.Setsid)
++}
++
++func (c *CmdWrapper) waitGroupExit(ctx context.Context) bool {
++	// A command without a group of its own is followed through the descendants
++	// that were signalled along with it.
++	alive := c.hasRunningTree
++	if c.ownsGroup() {
++		pgid := c.Pid()
++		alive = func() bool { return isGroupAlive(pgid) }
++	}
++	interval := groupPollMin
++	timer := time.NewTimer(interval)
++	defer timer.Stop()
++	for {
++		if !alive() {
++			return true
++		}
++		select {
++		case <-ctx.Done():
++			return false
++		case <-timer.C:
++		}
++		interval = min(interval*2, groupPollMax)
++		timer.Reset(interval)
++	}
++}
++
++// isGroupAlive reports whether the process group still has a live member.
++func isGroupAlive(pgid int) bool {
++	err := syscall.Kill(-pgid, 0)
++	if errors.Is(err, syscall.ESRCH) {
++		return false
++	}
++	// The group has members (EPERM means they belong to another user, as with
++	// an elevated process). That is not yet proof of life: members that have
++	// exited but were never reaped still count, and they stay forever when
++	// nothing reaps orphans - process-compose running as PID 1 of a container
++	// being the usual case.
++	return hasLiveGroupMember(pgid)
++}
++
++// exitCode returns the command's exit code. A command killed by a signal has
++// none of its own; it is reported as 128+signal rather than Go's -1, which is
++// not a valid exit status and reaches the caller of process-compose as 255.
++func exitCode(state *os.ProcessState) int {
++	if state == nil {
++		return -1
++	}
++	if status, ok := state.Sys().(syscall.WaitStatus); ok && status.Signaled() {
++		return exitCodeSignalBase + int(status.Signal())
++	}
++	return state.ExitCode()
++}
+diff --git a/src/command/stopper_windows.go b/src/command/stopper_windows.go
+index 4e29426..f21ed96 100644
+--- a/src/command/stopper_windows.go
++++ b/src/command/stopper_windows.go
+@@ -1,6 +1,8 @@
+ package command
+ 
+ import (
++	"context"
++	"os"
+ 	"os/exec"
+ 	"strconv"
+ 
+@@ -8,6 +10,9 @@ import (
+ )
+ 
+ func (c *CmdWrapper) Stop(sig int, parentOnly bool) error {
++	if c.cmd == nil || c.cmd.Process == nil {
++		return nil
++	}
+ 	pid := c.Pid()
+ 	if pid <= 0 {
+ 		return nil
+@@ -38,3 +43,13 @@ func (c *CmdWrapper) Stop(sig int, parentOnly bool) error {
+ func (c *CmdWrapper) SetCmdArgs() {
+ 	//empty for windows
+ }
++
++// waitGroupExit has nothing to wait for: taskkill /T /F terminates the whole
++// process tree before it returns.
++func (c *CmdWrapper) waitGroupExit(_ context.Context) bool {
++	return true
++}
++
++func exitCode(state *os.ProcessState) int {
++	return state.ExitCode()
++}
+diff --git a/src/pclog/logger_facade.go b/src/pclog/logger_facade.go
+index e8f25f8..4e0fb94 100644
+--- a/src/pclog/logger_facade.go
++++ b/src/pclog/logger_facade.go
+@@ -14,13 +14,18 @@ import (
+ )
+ 
+ type PCLog struct {
+-	logger        zerolog.Logger
+-	writer        *bufio.Writer
+-	file          io.WriteCloser
+-	logEventChan  chan logEvent
+-	wg            sync.WaitGroup
+-	closer        sync.Once
+-	isClosed      atomic.Bool
++	logger       zerolog.Logger
++	writer       *bufio.Writer
++	file         io.WriteCloser
++	logEventChan chan logEvent
++	wg           sync.WaitGroup
++	closer       sync.Once
++	isClosed     atomic.Bool
++	// sendMtx makes "check isClosed, then send" one step with respect to
++	// Close. Senders share it; Close takes it exclusively before closing the
++	// channel, so a line arriving as the log is closed is dropped rather than
++	// sent on a closed channel.
++	sendMtx       sync.RWMutex
+ 	noMetaData    bool
+ 	flushEachLine bool
+ }
+@@ -128,27 +133,37 @@ func (l *PCLog) getRollingWriter(filePath string, rotation *types.LogRotationCon
+ }
+ 
+ func (l *PCLog) Info(message string, process string, replica int) {
+-	if l.isClosed.Load() {
+-		return
+-	}
+-	l.logEventChan <- logEvent{
++	l.send(logEvent{
+ 		message: message,
+ 		process: process,
+ 		replica: replica,
+ 		isErr:   false,
+-	}
++	})
+ }
+ 
+ func (l *PCLog) Error(message string, process string, replica int) {
+-	if l.isClosed.Load() {
+-		return
+-	}
+-	l.logEventChan <- logEvent{
++	l.send(logEvent{
+ 		message: message,
+ 		process: process,
+ 		replica: replica,
+ 		isErr:   true,
++	})
++}
++
++// send queues an event unless the log has been closed.
++//
++// A process's output can keep arriving after the process has ended and its log
++// was closed - something it left running may still hold its stdout - so a
++// writer racing with Close is an ordinary occurrence, not a programming error.
++// The collector keeps draining the channel independently of sendMtx, so a
++// sender blocked on a full channel never keeps Close waiting for long.
++func (l *PCLog) send(event logEvent) {
++	l.sendMtx.RLock()
++	defer l.sendMtx.RUnlock()
++	if l.isClosed.Load() {
++		return
+ 	}
++	l.logEventChan <- event
+ }
+ 
+ func (l *PCLog) Close() {
+@@ -156,8 +171,10 @@ func (l *PCLog) Close() {
+ 		return
+ 	}
+ 	l.closer.Do(func() {
++		l.sendMtx.Lock()
+ 		l.isClosed.Store(true)
+ 		close(l.logEventChan)
++		l.sendMtx.Unlock()
+ 		l.wg.Wait()
+ 		l.writer.Flush()
+ 		l.file.Close()
+diff --git a/src/pclog/logger_facade_test.go b/src/pclog/logger_facade_test.go
+new file mode 100644
+index 0000000..66835b3
+--- /dev/null
++++ b/src/pclog/logger_facade_test.go
+@@ -0,0 +1,43 @@
++package pclog
++
++import (
++	"path/filepath"
++	"sync"
++	"testing"
++)
++
++// Lines can still arrive while - and after - the log is being closed: the
++// output of a process is read independently of the process ending. Closing must
++// drop them, not panic on a closed channel.
++func TestLoggerCloseWhileWriting(t *testing.T) {
++	for i := range 200 {
++		logger := NewLogger()
++		logger.Open(filepath.Join(t.TempDir(), "proc.log"), nil)
++
++		var writers sync.WaitGroup
++		start := make(chan struct{})
++		for w := range 4 {
++			writers.Add(1)
++			go func() {
++				defer writers.Done()
++				<-start
++				for range 50 {
++					if w%2 == 0 {
++						logger.Info("line", "proc", 0)
++					} else {
++						logger.Error("line", "proc", 0)
++					}
++				}
++			}()
++		}
++		close(start)
++		logger.Close()
++		writers.Wait()
++
++		// Closed for good: later writes are no-ops as well.
++		logger.Info("after close", "proc", 0)
++		if t.Failed() {
++			t.Fatalf("iteration %d", i)
++		}
++	}
++}
+diff --git a/src/tui/proc-table.go b/src/tui/proc-table.go
+index 8bbf278..dd37885 100644
+--- a/src/tui/proc-table.go
++++ b/src/tui/proc-table.go
+@@ -628,6 +628,22 @@ func (pv *pcView) selectFirstEnabledProcess() {
+ 	}
+ }
+ 
++// handleProcessRestart restarts a process off the UI goroutine. A restart
++// returns only once the old incarnation is gone, which takes as long as that
++// process needs to shut down - and the UI must stay responsive throughout.
++func (pv *pcView) handleProcessRestart(name string) {
++	ctx, cancel := context.WithCancel(context.Background())
++	pv.showAutoProgress(ctx, time.Second*1)
++	err := pv.project.RestartProcess(name)
++	cancel()
++	pv.appView.QueueUpdateDraw(func() {
++		if err != nil {
++			pv.showError(err.Error())
++		}
++		pv.showPassIfNeeded()
++	})
++}
++
+ func (pv *pcView) handleProcessStopped(name string) {
+ 	ctx, cancel := context.WithCancel(context.Background())
+ 	pv.showAutoProgress(ctx, time.Second*1)
+diff --git a/src/tui/view.go b/src/tui/view.go
+index c4062d1..36395f5 100644
+--- a/src/tui/view.go
++++ b/src/tui/view.go
+@@ -313,11 +313,7 @@ func (pv *pcView) setShortCutsActions() {
+ 	})
+ 	pv.shortcuts.setAction(ActionProcessRestart, func() {
+ 		name := pv.getSelectedProcName()
+-		err := pv.project.RestartProcess(name)
+-		if err != nil {
+-			pv.showError(err.Error())
+-		}
+-		pv.showPassIfNeeded()
++		go pv.handleProcessRestart(name)
+ 	})
+ 	pv.shortcuts.setAction(ActionDependencyGraph, pv.showGraphDialog)
+ 	pv.shortcuts.setAction(ActionCommandPalette, func() {
+@@ -739,7 +735,9 @@ func RunTUI(project app.IProject, options ...Option) {
+ 
+ func setSignal(ctx context.Context) {
+ 	cancelChan := make(chan os.Signal, 1)
+-	signal.Notify(cancelChan, syscall.SIGTERM, os.Interrupt, syscall.SIGHUP)
++	// SIGQUIT included: by default the Go runtime would dump its goroutines and
++	// exit without stopping a single process.
++	signal.Notify(cancelChan, syscall.SIGTERM, os.Interrupt, syscall.SIGHUP, syscall.SIGQUIT)
+ 	select {
+ 	case sig := <-cancelChan:
+ 		log.Info().Msgf("Caught %v - Shutting down the running processes...", sig)
+diff --git a/www/docs/configuration.md b/www/docs/configuration.md
+index c07de87..e9c96a2 100644
+--- a/www/docs/configuration.md
++++ b/www/docs/configuration.md
+@@ -622,6 +622,10 @@ processes:
+ 
+ > :bulb: `STDIN` and `Windows` are not supported at this time.
+ 
++A process with `is_tty` is [stopped](launcher.md#termination-parameters) like any other process: it receives the configured `shutdown.signal` (`SIGTERM` by default), whatever it writes while shutting down is captured in its log, and it reports its own exit code. Its terminal is closed only after it has exited.
++
++This differs from [interactive processes](interactive-processes.md) (`is_interactive`), which are terminal sessions and are ended by hanging up: `SIGTERM` is replaced by `SIGHUP` and the terminal is closed at once.
++
+ #### Elevated Processes
+ 
+ Process Compose uses `sudo` (on Linux and macOS) and `runas` (on Windows) to enable execution of elevated processes in both TUI and headless modes.
+diff --git a/www/docs/launcher.md b/www/docs/launcher.md
+index 7ad0ff9..fd65b7a 100644
+--- a/www/docs/launcher.md
++++ b/www/docs/launcher.md
+@@ -241,6 +241,27 @@ processes:
+ 
+ In case the `shutdown.timeout_seconds` is defined (without `shutdown.command`) and the process will fail to terminate within that time, the process group will receive the `SIGKILL` signal.
+ 
++### When Is a Process Stopped
++
++A process that was stopped by signalling its process group - the default - is stopped once its **whole process group** is gone, not when the command itself exits. The two are often far apart: a shell wrapper (`npm run dev`, `cd app && ./server`, a launcher script) dies the instant the signal arrives, while the server behind it is still draining connections and holding its port. Until the group is empty the process stays in the `Terminating` state.
++
++This is what makes a restart safe. Restarting a process - manually, on a [file change](watch.md), or by a project update - launches the new instance only after the old one is gone, so the two never compete for the same port:
++
++1. The process is stopped as described above.
++2. Process Compose waits for the process group to exit.
++3. The new instance is launched (after `backoff_seconds`, for a manual restart).
++
++How long step 2 may take is yours to decide:
++
++- With `shutdown.timeout_seconds` set, whatever is left of the process group is killed with `SIGKILL` when the timeout expires, and the restart proceeds.
++- Without it, a command that does not exit is never killed, and a restart waits for it for as long as it takes (a warning is logged every 10 seconds). If the command has exited but other members of its group linger, they are given 10 seconds before the process is reported as stopped anyway, with a warning.
++
++> :bulb: Set `shutdown.timeout_seconds` on any process that might not exit promptly on its stop signal.
++
++The foreground process of [`process-compose run`](cli/process-compose_run.md) is the one process without a group of its own: it shares the process group of `process-compose` itself so that it keeps the terminal. Stopping it signals the process and its child processes individually, never that group - `process-compose` and the script that launched it are left alone, and the script receives the project's exit code.
++
++Where the process group is not signalled, only the command itself is waited for: with `shutdown.parent_only: yes`, and with a `shutdown.command` or `shutdown.send_keys` that brings the process down within its timeout.
++
+ ### Stopping Interactive Processes With Keystrokes
+ 
+ Some tty/console programs exit only on a keystroke (e.g. `q`) and ignore termination signals. For these, `shutdown.send_keys` writes the configured keys to the process's stdin to trigger a clean, key-based shutdown. It requires `is_interactive: true` (or `is_tty: true`).
+@@ -268,9 +289,27 @@ Control keys can be expressed with escape sequences: `\xHH` (hex, e.g. `\x03` fo
+ 
+ If both `shutdown.command` and `shutdown.send_keys` are defined, `shutdown.command` takes precedence.
+ 
++### Stopping Process Compose Itself
++
++Process Compose stops its processes, as described above, before it exits. In headless mode (`-t=false`, `run`, detached) that happens on any of:
++
++| Trigger | Typical source |
++|---------|----------------|
++| `SIGINT` | `Ctrl+C` |
++| `SIGQUIT` | `Ctrl+\` |
++| `SIGTERM` | `kill`, a CI runner or supervisor |
++| `SIGHUP` | the terminal being closed |
++| its output being closed | `process-compose up -t=false \| head`, or a log collector that exits |
++
++All of them start the same graceful shutdown, and `process-compose` exits with `0` once every process is gone.
++
++A graceful shutdown waits for every process, so a process that ignores its stop signal and has no `shutdown.timeout_seconds` holds it up indefinitely. **Sending a second signal** - pressing `Ctrl+C` or `Ctrl+\` again, at least a second after the first - forces the matter: every process group is killed with `SIGKILL`, and `process-compose` exits with `128 + signal` (`130` for `SIGINT`, `131` for `SIGQUIT`). Signals that arrive together with the first one are treated as part of the same request, so a supervisor sending `SIGTERM` and `SIGHUP` at once still gets a graceful shutdown.
++
++> :bulb: `kill -9` (`SIGKILL`) cannot be handled by any program. If Process Compose is killed that way, its processes keep running; stop it with a signal it can act on instead. For a goroutine dump of a hung Process Compose - what `SIGQUIT` used to produce - send `SIGABRT`.
++
+ ## Successful Exit Codes
+ 
+-By default only exit code `0` is considered a success; any other code marks the process as `Failed`. When `process-compose` terminates a process with a signal, the process exits with the UNIX convention `128 + signal` — for example `130` for `SIGINT` (signal 2) or `143` for `SIGTERM` (signal 15). Many runtimes (JVM/Quarkus, Node/Vite, signal-respecting Go binaries) follow this convention, so a clean signal-driven shutdown would otherwise be reported as a failure.
++By default only exit code `0` is considered a success; any other code marks the process as `Failed`. A process that is terminated by a signal - whether `process-compose` sent it or something else did - is reported with the UNIX convention `128 + signal`: `130` for `SIGINT` (signal 2), `143` for `SIGTERM` (signal 15), `137` for `SIGKILL` (signal 9). Many runtimes (JVM/Quarkus, Node/Vite, signal-respecting Go binaries) also exit with these codes on their own after handling the signal, so a clean signal-driven shutdown would otherwise be reported as a failure.
+ 
+ `success_exit_codes` is a per-process allowlist of additional exit codes to treat as a success (modeled after systemd's `SuccessExitStatus`):
+ 
+@@ -310,9 +349,14 @@ processes:
+ 
+ 2. In case a process is daemon it will be considered running until stopped.
+ 
+-3. Daemon processes can only be stopped with the `$PROCESSNAME.shutdown.command` as in the example above.
++3. Daemon processes can only be stopped reliably with the `$PROCESSNAME.shutdown.command` as in the example above. Without one, Process Compose can only signal the process group of the command that launched the daemon:
+ 
+-4. If parent process (starter) won’t close `stdout` and `stderr` within specified `launch_timeout_seconds`, (default 5 seconds) process compose will stop waiting for its log completion and start waiting for process termination. (more details are [here](https://github.com/F1bonacc1/process-compose/issues/258#issuecomment-2439544894))
++    - A daemon that detached from that group - a real daemon does, e.g. `redis-server --daemonize yes` - is out of reach. Stopping or restarting it **fails** with an error saying so, and it keeps its `Launched` state, because it is still running. When the project shuts down it is left running, with a warning in the log.
++    - A daemon that is still in that group is signalled, and reported as stopped once it has actually exited (with `shutdown.timeout_seconds`, it is killed at the timeout).
++
++4. A daemon that inherits the `stdout` and `stderr` of its starter keeps them open after the starter exits. Process Compose does not wait for them to be closed: the daemon is considered launched as soon as the starter has exited and its own output has been read, and whatever the daemon writes afterwards still ends up in the process log. `launch_timeout_seconds` (default 5 seconds) is the upper bound on waiting for the starter's output when the daemon writes to it without pause. (more details are [here](https://github.com/F1bonacc1/process-compose/issues/258#issuecomment-2439544894))
++
++The same holds for any process, daemon or not: a command is finished when it exits, even if something it started in the background still holds its output. A migration script that leaves a helper running is `Completed` when the script ends, and the processes waiting for it with `process_completed` or `process_completed_successfully` start right away.
+ 
+ ## Foreground Processes
+ 
+@@ -413,6 +457,9 @@ processes:
+ > :bulb:
+ > `exit_on_end` can be set on more than one process, for example when running multiple tasks in parallel and wishing to terminate as soon as any one finished.
+ 
++> :bulb:
++> The exit code of `process-compose` is that of the process which caused the termination - the first one, if several qualify. The processes that are shut down as a consequence do not affect it, whatever their own `exit_on_end` or `exit_on_failure` settings and however they exit. Likewise, a shutdown you request yourself (`Ctrl+C`, `process-compose down`) exits with `0`.
++
+ ## Terminate Process Compose once given process is skipped
+ 
+ This can be achieved by setting `availability.exit_on_skipped` to `true`. If defined, `process-compose` will gracefully shut down all the other running processes and exit with exit-code `1`.
+diff --git a/www/docs/watch.md b/www/docs/watch.md
+index 24a0f69..374cb1a 100644
+--- a/www/docs/watch.md
++++ b/www/docs/watch.md
+@@ -98,6 +98,8 @@ A process that failed keeps `Failed` or `Error`. `Watching` never stands in for
+ 
+ The TUI also reports each watch-triggered restart in the status bar, naming the file that caused it. Bursts are folded into a single summary so that rapid restarts stay readable.
+ 
++A restart launches the new instance only once the old one - its whole process group - has exited, so a server that takes a moment to release its port is never raced by its own replacement. See [When Is a Process Stopped](launcher.md#when-is-a-process-stopped) for how long that may take and how to bound it with `shutdown.timeout_seconds`.
++
+ ## Project Lifetime
+ 
+ While any watch is armed, the project stays up even after every process has exited - otherwise a project of one-shot builders would exit before a watch could ever fire.
